@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -19,13 +21,7 @@ RATE = os.environ.get("RATE", "+6%").strip()
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
 VISUAL_QUERIES = os.environ.get("VISUAL_QUERIES", "").strip()
 MODE = os.environ.get("MODE", "generate_video").strip()
-
-VOICE_OPTIONS = {
-    "diego": "it-IT-DiegoNeural",
-    "alessio": "it-IT-AlessioMultilingualNeural",
-    "giuseppe": "it-IT-GiuseppeMultilingualNeural",
-    "rinaldo": "it-IT-RinaldoNeural",
-}
+REQUEST_ID = os.environ.get("REQUEST_ID", "manual").strip()
 
 
 def run(cmd):
@@ -43,12 +39,11 @@ def duration(path: Path) -> float:
     return max(0.1, float(out.strip()))
 
 
-def synthesize(text: str, out_mp3: Path, voice: str = None):
-    selected_voice = voice or VOICE
-    comm = edge_tts.Communicate(text, selected_voice, rate=RATE, boundary="WordBoundary")
+async def _synth_once(text: str, out_mp3: Path, voice: str):
+    comm = edge_tts.Communicate(text, voice, rate=RATE, boundary="WordBoundary")
     boundaries = []
     with out_mp3.open("wb") as f:
-        for chunk in comm.stream_sync():
+        async for chunk in comm.stream():
             if chunk["type"] == "audio":
                 f.write(chunk["data"])
             elif chunk["type"] == "WordBoundary":
@@ -57,9 +52,29 @@ def synthesize(text: str, out_mp3: Path, voice: str = None):
                     "start": chunk["offset"] / 10_000_000,
                     "end": (chunk["offset"] + chunk["duration"]) / 10_000_000,
                 })
-    if not out_mp3.exists() or out_mp3.stat().st_size < 1000:
-        raise RuntimeError("TTS non riuscito.")
     return boundaries
+
+
+def synthesize(text: str, out_mp3: Path, voice: str | None = None):
+    selected_voice = voice or VOICE
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            if out_mp3.exists():
+                out_mp3.unlink()
+            boundaries = asyncio.run(
+                asyncio.wait_for(
+                    _synth_once(text, out_mp3, selected_voice),
+                    timeout=50,
+                )
+            )
+            if not out_mp3.exists() or out_mp3.stat().st_size < 1000:
+                raise RuntimeError("TTS ha restituito un file vuoto.")
+            return boundaries
+        except Exception as exc:
+            last_error = exc
+            print(f"Tentativo TTS {attempt}/2 fallito: {exc}")
+    raise RuntimeError(f"TTS non riuscito dopo 2 tentativi: {last_error}")
 
 
 def auto_queries(script: str):
@@ -102,11 +117,7 @@ def search_videos(query: str):
         "per_page": 20,
         "locale": "en-US",
     }
-    attempts = [
-        {**base, "orientation": "portrait"},
-        base,
-    ]
-    for params in attempts:
+    for params in ({**base, "orientation": "portrait"}, base):
         r = requests.get(
             PEXELS_SEARCH,
             headers={"Authorization": PEXELS_API_KEY},
@@ -155,12 +166,9 @@ def normalize_clip(src: Path, dst: Path, seconds: float):
         "-t", f"{seconds:.3f}",
         "-vf",
         "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,fps=30,"
-        "eq=contrast=1.04:saturation=0.95",
-        "-an",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-        "-pix_fmt", "yuv420p",
-        str(dst),
+        "crop=1080:1920,fps=30,eq=contrast=1.04:saturation=0.95",
+        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-pix_fmt", "yuv420p", str(dst),
     ])
 
 
@@ -209,31 +217,47 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     lines = [header]
     for start, end, text in caption_groups(boundaries, 4):
         end = max(end, start + 0.45)
-        lines.append(
-            f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Captions,,0,0,0,,{esc(text)}\n"
-        )
+        lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Captions,,0,0,0,,{esc(text)}\n")
     if HOOK:
-        lines.append(
-            f"Dialogue: 1,0:00:00.00,{ass_time(min(2.8,total))},Hook,,0,0,0,,{esc(HOOK.upper())}\n"
-        )
+        lines.append(f"Dialogue: 1,0:00:00.00,{ass_time(min(2.8,total))},Hook,,0,0,0,,{esc(HOOK.upper())}\n")
     if OUTRO and total > 2.3:
-        lines.append(
-            f"Dialogue: 1,{ass_time(total-2.3)},{ass_time(total)},Outro,,0,0,0,,{esc(OUTRO)}\n"
-        )
+        lines.append(f"Dialogue: 1,{ass_time(total-2.3)},{ass_time(total)},Outro,,0,0,0,,{esc(OUTRO)}\n")
     path.write_text("".join(lines), encoding="utf-8")
 
 
+def write_meta(kind: str, status: str, extra: dict | None = None):
+    data = {
+        "request_id": REQUEST_ID,
+        "kind": kind,
+        "status": status,
+    }
+    if extra:
+        data.update(extra)
+    (OUT / "result.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
 def main():
+    if MODE == "deploy_only":
+        write_meta("deploy_only", "ok")
+        return
+
     if not SCRIPT:
         raise SystemExit("SCRIPT mancante.")
 
+    if MODE == "test_voice":
+        sample = SCRIPT[:320]
+        dest = OUT / "voice_test.mp3"
+        print(f"Creo anteprima voce {VOICE}...")
+        synthesize(sample, dest, voice=VOICE)
+        write_meta("test_voice", "ok", {"file": "voice_test.mp3"})
+        print(f"Creato {dest}")
+        return
+
     if MODE == "test_voices":
         sample = SCRIPT[:320]
-        print("Creo 4 anteprime voce...")
-        for label, voice in VOICE_OPTIONS.items():
-            dest = OUT / f"voce_{label}.mp3"
-            synthesize(sample, dest, voice=voice)
-            print(f"Creato {dest}")
+        dest = OUT / "voice_test.mp3"
+        synthesize(sample, dest, voice=VOICE)
+        write_meta("test_voice", "ok", {"file": "voice_test.mp3"})
         return
 
     if not PEXELS_API_KEY:
@@ -249,17 +273,12 @@ def main():
 
         queries = (
             [q.strip() for q in VISUAL_QUERIES.split(",") if q.strip()]
-            if VISUAL_QUERIES
-            else auto_queries(SCRIPT)
-        )
-        queries = queries[:5]
+            if VISUAL_QUERIES else auto_queries(SCRIPT)
+        )[:5]
         (OUT / "queries.txt").write_text("\n".join(queries), encoding="utf-8")
 
         print("2/5 Cerco le clip su Pexels...")
-        raw_clips = []
-        credits = []
-        used_ids = set()
-
+        raw_clips, credits, used_ids = [], [], set()
         fallback = ["watch close up", "watch movement", "luxury watch wrist", "watchmaker"]
         for q in queries + fallback:
             if len(raw_clips) >= 5:
@@ -294,15 +313,9 @@ def main():
             norm.append(dst)
 
         concat_file = work / "concat.txt"
-        concat_file.write_text(
-            "\n".join(f"file '{p.as_posix()}'" for p in norm),
-            encoding="utf-8",
-        )
+        concat_file.write_text("\n".join(f"file '{p.as_posix()}'" for p in norm), encoding="utf-8")
         visuals = work / "visuals.mp4"
-        run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_file), "-c", "copy", str(visuals)
-        ])
+        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(visuals)])
 
         print("4/5 Creo sottotitoli e hook...")
         ass = work / "captions.ass"
@@ -311,17 +324,12 @@ def main():
         print("5/5 Render finale...")
         final = OUT / "orologi_video.mp4"
         run([
-            "ffmpeg", "-y",
-            "-i", str(visuals),
-            "-i", str(voice_mp3),
+            "ffmpeg", "-y", "-i", str(visuals), "-i", str(voice_mp3),
             "-vf", f"ass={ass.as_posix()}",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
+            "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest", "-movflags", "+faststart",
-            str(final),
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart", str(final),
         ])
 
         caption = (
@@ -331,9 +339,9 @@ def main():
         )
         (OUT / "caption.txt").write_text(caption, encoding="utf-8")
         (OUT / "credits.txt").write_text(
-            "Visual forniti tramite Pexels.\n\n" + "\n".join(credits),
-            encoding="utf-8",
+            "Visual forniti tramite Pexels.\n\n" + "\n".join(credits), encoding="utf-8"
         )
+        write_meta("generate_video", "ok", {"file": "orologi_video.mp4", "duration": round(total, 2)})
         print(f"VIDEO PRONTO: {final} ({total:.1f}s)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
