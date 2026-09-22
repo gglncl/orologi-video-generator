@@ -1,24 +1,34 @@
 name: Generate Watch Video
 
+run-name: video-${{ inputs.request_id }}
+
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Cosa vuoi fare?"
+      request_id:
+        description: "ID richiesta"
         required: true
-        default: "test_voices"
+        default: "manual"
+        type: string
+
+      mode:
+        description: "Modalità"
+        required: true
+        default: "generate_video"
         type: choice
         options:
-          - test_voices
+          - deploy_only
+          - test_voice
           - generate_video
 
       script:
-        description: "Incolla qui lo script completo"
-        required: true
+        description: "Script completo"
+        required: false
+        default: ""
         type: string
 
       hook:
-        description: "Hook iniziale (es. 5.000 € E SI FERMA?)"
+        description: "Hook iniziale"
         required: false
         default: ""
         type: string
@@ -53,34 +63,54 @@ on:
         type: string
 
       visual_queries:
-        description: "Opzionale: ricerche Pexels separate da virgola. Lascia vuoto per automatico."
+        description: "Ricerche Pexels separate da virgola"
         required: false
         default: ""
         type: string
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
+
+    concurrency:
+      group: watch-video-generator
+      cancel-in-progress: false
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Scarica il repository
+      - name: Scarica repository
         uses: actions/checkout@v4
 
       - name: Prepara Python
+        if: ${{ inputs.mode != 'deploy_only' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Installa dipendenze
+        if: ${{ inputs.mode != 'deploy_only' }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
-          python -m pip install --upgrade pip
-          pip install edge-tts==7.2.8 "requests>=2.32.0"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          python -m pip install --upgrade pip -q
+          pip install edge-tts==7.2.8 "requests>=2.32.0" -q
 
-      - name: Genera
+      - name: Genera contenuto
+        if: ${{ inputs.mode != 'deploy_only' }}
         env:
+          REQUEST_ID: ${{ inputs.request_id }}
           MODE: ${{ inputs.mode }}
           SCRIPT: ${{ inputs.script }}
           HOOK: ${{ inputs.hook }}
@@ -89,12 +119,36 @@ jobs:
           OUTRO: ${{ inputs.outro }}
           VISUAL_QUERIES: ${{ inputs.visual_queries }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-        run: python generate_video.py
+        run: |
+          python generate_video.py
 
-      - name: Carica risultato
-        uses: actions/upload-artifact@v4
+      - name: Prepara sito
+        run: |
+          mkdir -p _site
+
+          cp index.html _site/
+          cp app.js _site/
+          cp styles.css _site/
+          cp manifest.json _site/
+          cp icon.svg _site/
+
+          if [ -d output ]; then
+            cp -f output/* _site/ 2>/dev/null || true
+          fi
+
+          printf '{"request_id":"%s","mode":"%s","deployed":true}\n' \
+          "${{ inputs.request_id }}" \
+          "${{ inputs.mode }}" \
+          > _site/deploy.json
+
+      - name: Configura GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Carica file GitHub Pages
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: watch-video-result
-          path: output/
-          if-no-files-found: error
-          retention-days: 7
+          path: _site
+
+      - name: Pubblica webapp
+        id: deployment
+        uses: actions/deploy-pages@v4
