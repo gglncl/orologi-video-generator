@@ -1,0 +1,100 @@
+name: Generate Watch Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Cosa vuoi fare?"
+        required: true
+        default: "test_voices"
+        type: choice
+        options:
+          - test_voices
+          - generate_video
+
+      script:
+        description: "Incolla qui lo script completo"
+        required: true
+        type: string
+
+      hook:
+        description: "Hook iniziale (es. 5.000 € E SI FERMA?)"
+        required: false
+        default: ""
+        type: string
+
+      voice:
+        description: "Voce"
+        required: true
+        default: "it-IT-DiegoNeural"
+        type: choice
+        options:
+          - it-IT-DiegoNeural
+          - it-IT-AlessioMultilingualNeural
+          - it-IT-GiuseppeMultilingualNeural
+          - it-IT-RinaldoNeural
+
+      rate:
+        description: "Velocità voce"
+        required: true
+        default: "+6%"
+        type: choice
+        options:
+          - "+0%"
+          - "+4%"
+          - "+6%"
+          - "+8%"
+          - "+10%"
+
+      outro:
+        description: "Testo finale"
+        required: false
+        default: "OROLOGI SPIEGATI SEMPLICE ⌚"
+        type: string
+
+      visual_queries:
+        description: "Opzionale: ricerche Pexels separate da virgola. Lascia vuoto per automatico."
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Scarica il repository
+        uses: actions/checkout@v4
+
+      - name: Prepara Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installa dipendenze
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          python -m pip install --upgrade pip
+          pip install edge-tts==7.2.8 "requests>=2.32.0"
+
+      - name: Genera
+        env:
+          MODE: ${{ inputs.mode }}
+          SCRIPT: ${{ inputs.script }}
+          HOOK: ${{ inputs.hook }}
+          VOICE: ${{ inputs.voice }}
+          RATE: ${{ inputs.rate }}
+          OUTRO: ${{ inputs.outro }}
+          VISUAL_QUERIES: ${{ inputs.visual_queries }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: python generate_video.py
+
+      - name: Carica risultato
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-video-result
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
