@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -99,74 +100,119 @@ def stable_number(value: str) -> int:
     return int(digest[:12], 16)
 
 
-def auto_queries(script: str):
-    s = script.lower()
-    found = []
+# Query intenzionalmente molto specifiche: "wristwatch" evita che Pexels
+# interpreti "watch" come verbo o restituisca visual generici non pertinenti.
+SCENE_RULES = [
+    (["comodino", "tavolo", "lasciato", "fermo", "si ferma", "ritrovato fermo"],
+     "mechanical wristwatch on bedside table close up"),
+    (["rotore", "massa oscillante", "oscillante"],
+     "automatic wristwatch rotor movement macro"),
+    (["molla", "molla principale", "riserva", "energia accumulata", "autonomia"],
+     "mechanical wristwatch mainspring movement macro"),
+    (["corona", "carica manuale", "ricaricare", "ricarica", "caricare"],
+     "hand winding mechanical wristwatch crown close up"),
+    (["polso", "indossarlo", "indossare", "indossi", "indossato"],
+     "mechanical wristwatch on wrist close up"),
+    (["quarzo", "batteria", "cristallo di quarzo"],
+     "quartz wristwatch movement battery close up"),
+    (["precisione", "preciso", "secondi", "lancetta"],
+     "wristwatch dial second hand macro"),
+    (["ingranaggi", "ruote", "meccanica", "movimento meccanico", "movimento"],
+     "mechanical wristwatch movement gears macro"),
+    (["orologiaio", "riparazione", "assemblaggio", "lavorazione"],
+     "watchmaker repairing mechanical wristwatch macro"),
+    (["lusso", "migliaia", "costoso", "rolex", "omega", "patek", "marchio"],
+     "luxury mechanical wristwatch close up"),
+    (["acciaio", "materiali", "cassa", "vetro", "zaffiro"],
+     "stainless steel mechanical wristwatch macro"),
+    (["acqua", "subacqueo", "diver", "impermeabile", "impermeabilità"],
+     "diver wristwatch underwater close up"),
+    (["cronografo", "cronometro", "pulsante", "pulsanti"],
+     "chronograph wristwatch pushers close up"),
+    (["cinturino", "bracciale"],
+     "wristwatch strap bracelet close up"),
+    (["automatico", "automatic"],
+     "automatic mechanical wristwatch close up"),
+]
 
-    def add(query):
-        if query not in found:
-            found.append(query)
 
-    # Scene molto specifiche prima dei visual generici.
-    if any(k in s for k in ["comodino", "notte", "dormire", "lasciato", "fermo", "si ferma"]):
-        add("watch on bedside table")
+def split_sentences(script: str):
+    cleaned = re.sub(r"\s+", " ", script).strip()
+    if not cleaned:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    return [p.strip() for p in parts if len(p.strip()) >= 8]
 
-    if any(k in s for k in ["rotore", "oscillante"]):
-        add("automatic watch rotor movement macro")
 
-    if any(k in s for k in ["corona", "carica", "ricarica", "ricaricare"]):
-        add("winding automatic watch crown close up")
+def query_for_sentence(sentence: str):
+    s = sentence.lower()
 
-    if any(k in s for k in ["polso", "indossarlo", "indossare"]):
-        add("automatic watch on wrist close up")
+    # Scegli la regola con il maggior numero di corrispondenze nella frase.
+    best_query = None
+    best_score = 0
 
-    if any(k in s for k in ["automatico", "automatic"]):
-        add("automatic watch movement macro")
+    for priority, (needles, query) in enumerate(SCENE_RULES):
+        matches = sum(1 for needle in needles if needle in s)
+        if matches:
+            # Le regole più specifiche in alto vincono a parità di match.
+            score = matches * 100 - priority
+            if score > best_score:
+                best_score = score
+                best_query = query
 
-    if any(k in s for k in ["quarzo", "batteria", "cristallo"]):
-        add("quartz watch close up")
+    return best_query
 
-    if any(k in s for k in ["ingranaggi", "ruote", "meccanica", "molla", "movimento"]):
-        add("mechanical watch gears macro")
 
-    if any(k in s for k in ["quadrante", "lancetta", "secondi", "precisione", "preciso"]):
-        add("watch dial second hand macro")
+def build_scene_queries(script: str, max_scenes: int = 6):
+    # Se l'utente compila Visual avanzati, rispettiamo esattamente quelle query.
+    if VISUAL_QUERIES:
+        manual = [q.strip() for q in VISUAL_QUERIES.split(",") if q.strip()]
+        return manual[:max_scenes]
 
-    if any(k in s for k in ["lusso", "migliaia", "costoso", "rolex", "omega", "patek", "marchio"]):
-        add("luxury watch wrist macro")
+    scenes = []
 
-    if any(k in s for k in ["orologiaio", "lavorazione", "assemblaggio"]):
-        add("watchmaker working on watch movement")
-
-    # Riempimento solo se servono altre clip.
-    for q in [
-        "mechanical watch macro cinematic",
-        "watch movement close up",
-        "watch wrist close up",
-        "watchmaker macro",
-        "watch dial macro",
-    ]:
-        if len(found) >= 5:
+    for sentence in split_sentences(script):
+        query = query_for_sentence(sentence)
+        if query and query not in scenes:
+            scenes.append(query)
+        if len(scenes) >= max_scenes:
             break
-        add(q)
 
-    return found[:5]
+    # Secondo passaggio sull'intero script per concetti citati ma non selezionati.
+    whole = script.lower()
+    for needles, query in SCENE_RULES:
+        if any(n in whole for n in needles) and query not in scenes:
+            scenes.append(query)
+        if len(scenes) >= max_scenes:
+            break
+
+    # Fallback SOLO orologieri e comunque specifici.
+    fallbacks = [
+        "mechanical wristwatch movement gears macro",
+        "automatic mechanical wristwatch on wrist close up",
+        "wristwatch dial second hand macro",
+        "watchmaker repairing mechanical wristwatch macro",
+        "mechanical wristwatch crown close up",
+        "mechanical wristwatch close up cinematic",
+    ]
+
+    for query in fallbacks:
+        if query not in scenes:
+            scenes.append(query)
+        if len(scenes) >= max_scenes:
+            break
+
+    return scenes[:max_scenes]
 
 
 def search_videos(query: str):
-    seed = stable_number(f"{SAFE_REQUEST_ID}:{query}")
-    preferred_page = 1 + (seed % 3)
-
-    pages = []
-    for page in [preferred_page, 1, 2, 3]:
-        if page not in pages:
-            pages.append(page)
-
-    for page in pages:
+    # La pagina 1 di Pexels è generalmente la più pertinente.
+    # Usiamo pagina 2 solo come seconda scelta per avere più varietà.
+    for page in [1, 2]:
         base = {
             "query": query,
             "size": "medium",
-            "per_page": 30,
+            "per_page": 24,
             "page": page,
             "locale": "en-US",
         }
@@ -207,6 +253,57 @@ def choose_mp4(video):
         return portrait * 20 + pixels * 2 - ratio_penalty
 
     return max(candidates, key=score)
+
+
+def video_relevance(video, query: str, rank: int):
+    url = str(video.get("url") or "").lower()
+    query_words = [
+        w for w in re.findall(r"[a-z]+", query.lower())
+        if w not in {"close", "up", "macro", "cinematic", "mechanical", "automatic"}
+    ]
+
+    score = max(0, 30 - rank * 3)
+
+    # URL Pexels contiene spesso parole descrittive della clip.
+    if "watch" in url or "wrist" in url or "timepiece" in url:
+        score += 45
+
+    for word in query_words:
+        if len(word) >= 4 and word in url:
+            score += 8
+
+    # Bonus ai video verticali reali.
+    w = video.get("width") or 1
+    h = video.get("height") or 1
+    if h > w:
+        score += 12
+
+    return score
+
+
+def pick_video(videos, query: str, used_ids: set, scene_index: int):
+    viable = []
+
+    # Limitiamo la scelta ai risultati più in alto: evita di pescare clip
+    # casuali e poco pertinenti solo per ottenere varietà.
+    for rank, video in enumerate(videos[:10]):
+        if video.get("id") in used_ids:
+            continue
+        media = choose_mp4(video)
+        if not media:
+            continue
+        viable.append((video_relevance(video, query, rank), rank, video, media))
+
+    if not viable:
+        return None, None
+
+    viable.sort(key=lambda x: (-x[0], x[1]))
+
+    # Varia soltanto fra le 3 clip più pertinenti, non fra 20-30 risultati.
+    shortlist = viable[:min(3, len(viable))]
+    pick = stable_number(f"{SAFE_REQUEST_ID}:{query}:{scene_index}") % len(shortlist)
+    _, _, video, media = shortlist[pick]
+    return video, media
 
 
 def download(url: str, dest: Path):
@@ -341,62 +438,50 @@ def main():
         boundaries = synthesize(SCRIPT, voice_mp3, voice=GIUSEPPE)
         total = duration(voice_mp3)
 
-        queries = (
-            [q.strip() for q in VISUAL_QUERIES.split(",") if q.strip()]
-            if VISUAL_QUERIES else auto_queries(SCRIPT)
-        )[:5]
-
+        queries = build_scene_queries(SCRIPT, max_scenes=6)
         (OUT / "queries.txt").write_text("\n".join(queries), encoding="utf-8")
 
-        print("Query visual:")
-        for q in queries:
-            print(f"- {q}")
+        print("Scene visual selezionate:")
+        for i, q in enumerate(queries, 1):
+            print(f"{i}. {q}")
 
         print("2/5 Cerco le clip su Pexels...")
         raw_clips = []
         credits = []
         used_ids = set()
+        used_queries = []
 
-        fallback = [
-            "watch close up cinematic",
-            "watch movement macro",
-            "watch wrist close up",
-            "watchmaker close up",
-        ]
-
-        for q in queries + fallback:
-            if len(raw_clips) >= 5:
+        for scene_index, query in enumerate(queries):
+            if len(raw_clips) >= 6:
                 break
 
-            videos = search_videos(q)
-            viable = [
-                v for v in videos
-                if v.get("id") not in used_ids and choose_mp4(v)
-            ]
+            videos = search_videos(query)
+            chosen, media = pick_video(videos, query, used_ids, scene_index)
 
-            if not viable:
+            if not chosen or not media:
+                print(f"Nessuna clip valida per: {query}")
                 continue
 
-            pick = stable_number(
-                f"{SAFE_REQUEST_ID}:{q}:{len(raw_clips)}"
-            ) % len(viable)
-
-            chosen = viable[pick]
-            media = choose_mp4(chosen)
             dest = work / f"raw_{len(raw_clips)}.mp4"
-
             download(media["link"], dest)
+
             raw_clips.append(dest)
             used_ids.add(chosen.get("id"))
+            used_queries.append(query)
 
             creator = (chosen.get("user") or {}).get("name", "Pexels creator")
             chosen_url = chosen.get("url", "https://www.pexels.com")
-            credits.append(f"{q} | id={chosen.get('id')} | {creator} | {chosen_url}")
+            credits.append(
+                f"{query} | id={chosen.get('id')} | {creator} | {chosen_url}"
+            )
 
-            print(f"Clip scelta: query='{q}' id={chosen.get('id')}")
+            print(f"Clip scelta: scena={scene_index + 1} query='{query}' id={chosen.get('id')}")
 
         if len(raw_clips) < 3:
-            raise RuntimeError("Pexels ha restituito meno di 3 clip utilizzabili.")
+            raise RuntimeError(
+                "Pexels ha restituito meno di 3 clip pertinenti. "
+                "Prova a compilare Visual avanzati con 3-6 ricerche specifiche."
+            )
 
         print("3/5 Adatto le clip al formato TikTok...")
         each = total / len(raw_clips)
@@ -458,7 +543,7 @@ def main():
             {
                 "file": video_filename,
                 "duration": round(total, 2),
-                "queries": queries,
+                "queries": used_queries,
                 "video_ids": list(used_ids),
             }
         )
