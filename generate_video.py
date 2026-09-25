@@ -12,6 +12,7 @@ import edge_tts
 import requests
 
 PEXELS_SEARCH = "https://api.pexels.com/v1/videos/search"
+PIXABAY_SEARCH = "https://pixabay.com/api/videos/"
 OUT = Path("output")
 OUT.mkdir(exist_ok=True)
 
@@ -21,6 +22,7 @@ OUTRO = os.environ.get("OUTRO", "").strip()
 VOICE = os.environ.get("VOICE", "it-IT-GiuseppeMultilingualNeural").strip()
 RATE = os.environ.get("RATE", "+6%").strip()
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
+PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip()
 VISUAL_QUERIES = os.environ.get("VISUAL_QUERIES", "").strip()
 MODE = os.environ.get("MODE", "generate_video").strip()
 REQUEST_ID = os.environ.get("REQUEST_ID", "manual").strip()
@@ -409,9 +411,22 @@ def choose_query_for_scene(unit: str, scene_index: int, used_queries: list[str],
     return entries[scene_index % len(entries)]
 
 
-def search_videos(query: str, scene_index: int):
+def _query_words(query: str):
+    return [
+        w for w in re.findall(r"[a-z]+", query.lower())
+        if len(w) >= 4 and w not in {
+            "close", "macro", "mechanical", "automatic", "wristwatch", "watch"
+        }
+    ]
+
+
+def search_pexels(query: str, scene_index: int):
+    if not PEXELS_API_KEY:
+        return []
+
     first_page = 1 if scene_index % 2 == 0 else 2
     pages = [first_page, 2 if first_page == 1 else 1]
+
     for page in pages:
         base = {
             "query": query,
@@ -420,6 +435,7 @@ def search_videos(query: str, scene_index: int):
             "page": page,
             "locale": "en-US",
         }
+
         for params in ({**base, "orientation": "portrait"}, base):
             r = requests.get(
                 PEXELS_SEARCH,
@@ -428,14 +444,73 @@ def search_videos(query: str, scene_index: int):
                 timeout=30,
             )
             if not r.ok:
-                raise RuntimeError(f"Pexels {r.status_code}: {r.text[:300]}")
-            videos = r.json().get("videos", [])
-            if videos:
-                return videos
+                print(f"Pexels {r.status_code}: {r.text[:200]}")
+                continue
+
+            out = []
+            for rank, video in enumerate(r.json().get("videos", [])[:16]):
+                media = choose_pexels_mp4(video)
+                if not media:
+                    continue
+                out.append({
+                    "source": "pexels",
+                    "id": str(video.get("id")),
+                    "ref": f"pexels:{video.get('id')}",
+                    "media_url": media.get("link"),
+                    "page_url": video.get("url") or "https://www.pexels.com",
+                    "creator": (video.get("user") or {}).get("name", "Pexels creator"),
+                    "width": video.get("width") or media.get("width") or 1,
+                    "height": video.get("height") or media.get("height") or 1,
+                    "tags": str(video.get("url") or ""),
+                    "rank": rank,
+                })
+            if out:
+                return out
     return []
 
 
-def choose_mp4(video):
+def search_pixabay(query: str, scene_index: int):
+    if not PIXABAY_API_KEY:
+        return []
+
+    page = 1 if scene_index % 2 == 0 else 2
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": query[:100],
+        "lang": "en",
+        "video_type": "film",
+        "safesearch": "true",
+        "order": "popular",
+        "page": page,
+        "per_page": 30,
+    }
+
+    r = requests.get(PIXABAY_SEARCH, params=params, timeout=30)
+    if not r.ok:
+        print(f"Pixabay {r.status_code}: {r.text[:200]}")
+        return []
+
+    out = []
+    for rank, hit in enumerate(r.json().get("hits", [])[:20]):
+        media = choose_pixabay_mp4(hit)
+        if not media:
+            continue
+        out.append({
+            "source": "pixabay",
+            "id": str(hit.get("id")),
+            "ref": f"pixabay:{hit.get('id')}",
+            "media_url": media.get("url"),
+            "page_url": hit.get("pageURL") or "https://pixabay.com/videos/",
+            "creator": hit.get("user") or "Pixabay creator",
+            "width": media.get("width") or 1,
+            "height": media.get("height") or 1,
+            "tags": hit.get("tags") or "",
+            "rank": rank,
+        })
+    return out
+
+
+def choose_pexels_mp4(video):
     candidates = [
         f for f in video.get("video_files", [])
         if f.get("file_type") == "video/mp4" and f.get("link")
@@ -454,32 +529,93 @@ def choose_mp4(video):
     return max(candidates, key=score)
 
 
-def pick_video(videos, query: str, used_ids: set, scene_index: int):
-    viable = []
-    for rank, video in enumerate(videos[:12]):
-        vid = video.get("id")
-        if not vid or vid in used_ids:
-            continue
-        media = choose_mp4(video)
-        if not media:
-            continue
-        w = video.get("width") or 1
-        h = video.get("height") or 1
-        score = max(0, 40 - rank * 3)
-        if h > w:
-            score += 15
-        url = str(video.get("url") or "").lower()
-        if any(x in url for x in ["watch", "wrist", "timepiece"]):
-            score += 35
-        viable.append((score, rank, video, media))
-    if not viable:
-        return None, None
-    viable.sort(key=lambda x: (-x[0], x[1]))
-    shortlist = viable[:min(4, len(viable))]
-    pick = stable_number(f"{SAFE_REQUEST_ID}:{query}:{scene_index}") % len(shortlist)
-    _, _, video, media = shortlist[pick]
-    return video, media
+def choose_pixabay_mp4(hit):
+    videos = hit.get("videos") or {}
+    candidates = []
+    for name in ("medium", "large", "small", "tiny"):
+        item = videos.get(name) or {}
+        if item.get("url"):
+            candidates.append(item)
+    if not candidates:
+        return None
 
+    def score(item):
+        w = item.get("width") or 1
+        h = item.get("height") or 1
+        portrait = 1 if h >= w else 0
+        ratio_penalty = abs((w / h) - (9 / 16))
+        pixels = min(w * h, 1080 * 1920) / (1080 * 1920)
+        return portrait * 20 + pixels * 2 - ratio_penalty
+
+    return max(candidates, key=score)
+
+
+def candidate_score(candidate, query: str):
+    rank = candidate.get("rank", 0)
+    score = max(0, 45 - rank * 3)
+
+    w = candidate.get("width") or 1
+    h = candidate.get("height") or 1
+    if h > w:
+        score += 18
+
+    haystack = (candidate.get("tags") or "").lower()
+    words = _query_words(query)
+    for word in words:
+        if word in haystack:
+            score += 9
+
+    if any(x in haystack for x in ["watch", "wrist", "timepiece", "orolog"]):
+        score += 35
+
+    return score
+
+
+def pick_from_source(candidates, query: str, used_refs: set, scene_index: int):
+    viable = [c for c in candidates if c.get("ref") not in used_refs and c.get("media_url")]
+    if not viable:
+        return None
+
+    viable.sort(key=lambda c: (-candidate_score(c, query), c.get("rank", 0)))
+    shortlist = viable[:min(4, len(viable))]
+    idx = stable_number(
+        f"{SAFE_REQUEST_ID}:{query}:{scene_index}:{shortlist[0].get('source')}"
+    ) % len(shortlist)
+    return shortlist[idx]
+
+
+def choose_source_candidate(query: str, scene_index: int, used_refs: set, used_sources: list[str]):
+    pexels = search_pexels(query, scene_index)
+    pixabay = search_pixabay(query, scene_index)
+
+    p_pick = pick_from_source(pexels, query, used_refs, scene_index)
+    x_pick = pick_from_source(pixabay, query, used_refs, scene_index)
+
+    available = {"pexels": p_pick, "pixabay": x_pick}
+    available = {k: v for k, v in available.items() if v}
+    if not available:
+        return None
+
+    # Alternanza fonte: se entrambe sono disponibili, evita la fonte della scena precedente.
+    if len(available) == 2:
+        previous = used_sources[-1] if used_sources else None
+        preferred = "pixabay" if previous == "pexels" else "pexels"
+
+        # Il primo fotogramma cambia sorgente tra richieste diverse, così anche
+        # rigenerando lo stesso argomento non parte sempre dalla stessa libreria.
+        if previous is None:
+            preferred = "pixabay" if stable_number(SAFE_REQUEST_ID) % 2 else "pexels"
+
+        preferred_pick = available[preferred]
+        other_source = "pexels" if preferred == "pixabay" else "pixabay"
+        other_pick = available[other_source]
+
+        # Se la clip preferita è palesemente meno pertinente, usa l'altra.
+        if candidate_score(preferred_pick, query) + 22 < candidate_score(other_pick, query):
+            return other_pick
+        return preferred_pick
+
+    return next(iter(available.values()))
 
 def download(url: str, dest: Path):
     with requests.get(url, stream=True, timeout=90) as r:
@@ -577,8 +713,8 @@ def main():
         synthesize(sample, dest, voice=GIUSEPPE)
         write_meta("test_voice", "ok", {"file": filename})
         return
-    if not PEXELS_API_KEY:
-        raise SystemExit("PEXELS_API_KEY mancante.")
+    if not PEXELS_API_KEY and not PIXABAY_API_KEY:
+        raise SystemExit("Serve almeno una chiave tra PEXELS_API_KEY e PIXABAY_API_KEY.")
 
     work = Path(tempfile.mkdtemp(prefix="watchvideo_"))
     try:
@@ -592,13 +728,14 @@ def main():
         manual_queries = [q.strip() for q in VISUAL_QUERIES.split(",") if q.strip()]
 
         print(f"Scene automatiche: {len(scene_units)}")
-        print("2/5 Cerco visual coerenti su Pexels...")
+        print("2/5 Cerco visual coerenti su Pexels + Pixabay...")
 
         raw_clips = []
         credits = []
-        used_ids = set()
+        used_refs = set()
         used_queries = []
         used_types = []
+        used_sources = []
         scene_debug = []
 
         for scene_index, unit in enumerate(scene_units):
@@ -608,44 +745,48 @@ def main():
             else:
                 query, query_type = choose_query_for_scene(unit, scene_index, used_queries, used_types)
 
-            videos = search_videos(query, scene_index)
-            chosen, media = pick_video(videos, query, used_ids, scene_index)
+            chosen = choose_source_candidate(
+                query, scene_index, used_refs, used_sources
+            )
 
-            if not chosen or not media:
-                # Fallback forzando un tipo visivo diverso dalle ultime scene.
+            if not chosen:
+                # Fallback: cambia anche famiglia visuale prima di arrendersi.
                 fallback_entries = [e for e in GENERIC_QUERIES if e[1] not in set(used_types[-2:])]
                 if not fallback_entries:
                     fallback_entries = GENERIC_QUERIES
                 fallback_query, fallback_type = fallback_entries[scene_index % len(fallback_entries)]
-                videos = search_videos(fallback_query, scene_index)
-                chosen, media = pick_video(videos, fallback_query, used_ids, scene_index)
+                chosen = choose_source_candidate(
+                    fallback_query, scene_index, used_refs, used_sources
+                )
                 query, query_type = fallback_query, fallback_type
 
-            if not chosen or not media:
+            if not chosen:
                 raise RuntimeError(f"Nessun visual utilizzabile per la scena {scene_index + 1}")
 
             dest = work / f"raw_{scene_index}.mp4"
-            download(media["link"], dest)
+            download(chosen["media_url"], dest)
             raw_clips.append(dest)
-            used_ids.add(chosen.get("id"))
+            used_refs.add(chosen["ref"])
             used_queries.append(query)
             used_types.append(query_type)
+            used_sources.append(chosen["source"])
 
-            creator = (chosen.get("user") or {}).get("name", "Pexels creator")
-            chosen_url = chosen.get("url", "https://www.pexels.com")
             credits.append(
-                f"Scena {scene_index + 1} | {query} | tipo={query_type} | id={chosen.get('id')} | {creator} | {chosen_url}"
+                f"Scena {scene_index + 1} | fonte={chosen['source']} | {query} | "
+                f"tipo={query_type} | id={chosen['id']} | {chosen['creator']} | {chosen['page_url']}"
             )
             scene_debug.append({
                 "scene": scene_index + 1,
                 "text": unit,
                 "query": query,
                 "query_type": query_type,
-                "video_id": chosen.get("id"),
+                "source": chosen["source"],
+                "video_id": chosen["id"],
                 "seconds": round(durations[scene_index], 2),
             })
             print(
-                f"Scena {scene_index + 1}: tipo='{query_type}' query='{query}' id={chosen.get('id')} durata={durations[scene_index]:.1f}s"
+                f"Scena {scene_index + 1}: fonte='{chosen['source']}' tipo='{query_type}' "
+                f"query='{query}' id={chosen['id']} durata={durations[scene_index]:.1f}s"
             )
 
         print("3/5 Adatto le clip al formato TikTok...")
@@ -677,7 +818,7 @@ def main():
         ])
 
         (OUT / "scene_plan.json").write_text(json.dumps(scene_debug, ensure_ascii=False, indent=2), encoding="utf-8")
-        (OUT / "credits.txt").write_text("Visual forniti tramite Pexels.\n\n" + "\n".join(credits), encoding="utf-8")
+        (OUT / "credits.txt").write_text("Visual forniti tramite Pexels e Pixabay.\n\n" + "\n".join(credits), encoding="utf-8")
 
         write_meta(
             "generate_video",
@@ -687,7 +828,8 @@ def main():
                 "duration": round(total, 2),
                 "scene_count": len(scene_debug),
                 "scenes": scene_debug,
-                "video_ids": list(used_ids),
+                "video_refs": list(used_refs),
+                "sources": used_sources,
             },
         )
 
