@@ -56,11 +56,11 @@ on:
       outro:
         description: "Testo finale"
         required: false
-        default: "OROLOGI SPIEGATI SEMPLICE ⌚"
+        default: ""
         type: string
 
       visual_queries:
-        description: "Ricerche Pexels separate da virgola"
+        description: "Visual avanzati opzionali separati da virgola"
         required: false
         default: ""
         type: string
@@ -115,7 +115,10 @@ jobs:
           RATE: ${{ inputs.rate }}
           OUTRO: ${{ inputs.outro }}
           VISUAL_QUERIES: ${{ inputs.visual_queries }}
+
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+
         run: |
           python generate_video.py
 
