@@ -362,8 +362,10 @@ def scene_durations(scene_units, total_seconds: float):
 
 
 def concept_query_entries_for_text(text: str):
+    """Restituisce SOLO visual semanticamente collegati al testo della scena."""
     t = text.lower()
     ranked = []
+
     for idx, concept in enumerate(CONCEPTS):
         score = 0
         for kw in concept["keywords"]:
@@ -371,6 +373,7 @@ def concept_query_entries_for_text(text: str):
                 score += 3 if " " in kw else 1
         if score:
             ranked.append((score, -idx, concept["queries"]))
+
     ranked.sort(reverse=True)
 
     result = []
@@ -378,51 +381,153 @@ def concept_query_entries_for_text(text: str):
         for entry in entries:
             if entry not in result:
                 result.append(entry)
+
     return result
 
 
-def choose_query_for_scene(unit: str, scene_index: int, used_queries: list[str], used_types: list[str]):
-    entries = concept_query_entries_for_text(unit)
-    if not entries:
-        entries = GENERIC_QUERIES[:]
+def resolve_scene_entries(scene_units):
+    """
+    V8: una frase generica (es. "Non necessariamente") non riceve più un visual
+    casuale. Eredita il tema dalla scena semanticamente più vicina.
+    """
+    direct = [concept_query_entries_for_text(unit) for unit in scene_units]
 
-    for entry in GENERIC_QUERIES:
-        if entry not in entries:
-            entries.append(entry)
+    # Pool dell'intero video, usato soltanto se una scena non ha parole chiave.
+    topic_pool = []
+    for entries in direct:
+        for entry in entries:
+            if entry not in topic_pool:
+                topic_pool.append(entry)
 
+    resolved = []
+    for i, entries in enumerate(direct):
+        if entries:
+            resolved.append(entries)
+            continue
+
+        inherited = []
+
+        # Cerca prima nelle scene adiacenti: 1 indietro, 1 avanti, 2 indietro...
+        for distance in range(1, len(scene_units)):
+            indexes = (i - distance, i + distance)
+            for j in indexes:
+                if 0 <= j < len(direct) and direct[j]:
+                    inherited = direct[j][:]
+                    break
+            if inherited:
+                break
+
+        if not inherited:
+            inherited = topic_pool[:] if topic_pool else GENERIC_QUERIES[:]
+
+        resolved.append(inherited)
+
+    return resolved
+
+
+def order_scene_queries(entries, scene_index: int, used_queries: list[str], used_types: list[str]):
+    """
+    La pertinenza è già garantita da `entries`.
+    Qui la varietà viene usata SOLO come criterio secondario.
+    """
     recent_queries = set(used_queries[-3:])
     recent_types = set(used_types[-2:])
 
-    # 1) Preferisci entry non usate di recente e di tipo diverso.
-    best = [e for e in entries if e[0] not in recent_queries and e[1] not in recent_types]
-    if best:
-        return best[stable_number(f"{SAFE_REQUEST_ID}:{scene_index}:best") % len(best)]
+    def penalty(entry):
+        query, query_type = entry
+        p = 0
+        if query in recent_queries:
+            p += 4
+        if query_type in recent_types:
+            p += 2
+        if query in used_queries:
+            p += 1
+        # Tie-break deterministico, così rigenerazioni diverse possono variare.
+        tie = stable_number(f"{SAFE_REQUEST_ID}:{scene_index}:{query}") % 1000
+        return (p, tie)
 
-    # 2) Poi entry di tipo diverso, anche se query già usata.
-    type_fresh = [e for e in entries if e[1] not in recent_types]
-    if type_fresh:
-        return type_fresh[stable_number(f"{SAFE_REQUEST_ID}:{scene_index}:type") % len(type_fresh)]
-
-    # 3) Poi entry con query non recente.
-    query_fresh = [e for e in entries if e[0] not in recent_queries]
-    if query_fresh:
-        return query_fresh[stable_number(f"{SAFE_REQUEST_ID}:{scene_index}:query") % len(query_fresh)]
-
-    return entries[scene_index % len(entries)]
+    return sorted(entries, key=penalty)
 
 
 def _query_words(query: str):
     return [
         w for w in re.findall(r"[a-z]+", query.lower())
         if len(w) >= 4 and w not in {
-            "close", "macro", "mechanical", "automatic", "wristwatch", "watch"
+            "close", "macro", "mechanical", "automatic", "wristwatch", "watch",
+            "luxury", "steel", "person"
         }
     ]
+
+
+WATCH_SIGNALS = (
+    "watch", "wrist", "wristwatch", "timepiece", "watchmaker", "horolog",
+    "chronograph", "clockwork", "dial"
+)
+
+TYPE_SIGNALS = {
+    "dial": ("dial", "second", "hand", "face", "hands"),
+    "movement": ("movement", "gear", "gears", "rotor", "spring", "clockwork", "mechanism"),
+    "watchmaker": ("watchmaker", "repair", "workshop", "tool", "tools", "movement"),
+    "crown": ("crown", "wind", "winding", "adjust", "setting"),
+    "wrist": ("wrist", "wear", "wearing"),
+    "lifestyle": ("wrist", "wear", "wearing", "hand", "hands"),
+    "caseback": ("case", "back", "caseback", "rear"),
+    "case": ("case", "steel", "watch", "wristwatch"),
+    "water": ("water", "splash", "rain", "wet", "wrist"),
+    "diver": ("diver", "diving", "underwater", "bezel", "wrist"),
+    "bezel": ("bezel", "diver", "dial"),
+    "bracelet": ("bracelet", "strap", "clasp", "band"),
+    "pushers": ("pusher", "pushers", "chronograph", "button", "buttons"),
+    "table": ("table", "desk", "bedside", "watch", "wristwatch"),
+    "store": ("store", "shop", "display", "showcase", "watch", "wristwatch"),
+    "collection": ("collection", "watches", "watch", "display"),
+}
+
+
+def candidate_semantic_score(candidate, query: str, query_type: str):
+    """
+    Punteggio di pertinenza prima della varietà.
+    Una clip senza alcun segnale di orologeria viene scartata.
+    """
+    haystack = (
+        f"{candidate.get('tags') or ''} {candidate.get('page_url') or ''}"
+    ).lower()
+
+    if not any(signal in haystack for signal in WATCH_SIGNALS):
+        return None
+
+    score = 100
+
+    # Il ranking del provider conta, ma meno della pertinenza.
+    score += max(0, 24 - int(candidate.get("rank", 0)) * 2)
+
+    w = candidate.get("width") or 1
+    h = candidate.get("height") or 1
+    if h > w:
+        score += 12
+
+    for word in _query_words(query):
+        if word in haystack:
+            score += 10
+
+    for word in TYPE_SIGNALS.get(query_type, ()):
+        if word in haystack:
+            score += 12
+
+    return score
+
+
+_PEXELS_CACHE = {}
+_PIXABAY_CACHE = {}
 
 
 def search_pexels(query: str, scene_index: int):
     if not PEXELS_API_KEY:
         return []
+
+    cache_key = (query, scene_index % 2)
+    if cache_key in _PEXELS_CACHE:
+        return _PEXELS_CACHE[cache_key]
 
     first_page = 1 if scene_index % 2 == 0 else 2
     pages = [first_page, 2 if first_page == 1 else 1]
@@ -448,7 +553,7 @@ def search_pexels(query: str, scene_index: int):
                 continue
 
             out = []
-            for rank, video in enumerate(r.json().get("videos", [])[:16]):
+            for rank, video in enumerate(r.json().get("videos", [])[:18]):
                 media = choose_pexels_mp4(video)
                 if not media:
                     continue
@@ -465,7 +570,10 @@ def search_pexels(query: str, scene_index: int):
                     "rank": rank,
                 })
             if out:
+                _PEXELS_CACHE[cache_key] = out
                 return out
+
+    _PEXELS_CACHE[cache_key] = []
     return []
 
 
@@ -473,41 +581,54 @@ def search_pixabay(query: str, scene_index: int):
     if not PIXABAY_API_KEY:
         return []
 
-    page = 1 if scene_index % 2 == 0 else 2
-    params = {
-        "key": PIXABAY_API_KEY,
-        "q": query[:100],
-        "lang": "en",
-        "video_type": "film",
-        "safesearch": "true",
-        "order": "popular",
-        "page": page,
-        "per_page": 30,
-    }
+    cache_key = (query, scene_index % 2)
+    if cache_key in _PIXABAY_CACHE:
+        return _PIXABAY_CACHE[cache_key]
 
-    r = requests.get(PIXABAY_SEARCH, params=params, timeout=30)
-    if not r.ok:
-        print(f"Pixabay {r.status_code}: {r.text[:200]}")
-        return []
+    preferred_page = 1 if scene_index % 2 == 0 else 2
+    pages = [preferred_page, 2 if preferred_page == 1 else 1]
 
-    out = []
-    for rank, hit in enumerate(r.json().get("hits", [])[:20]):
-        media = choose_pixabay_mp4(hit)
-        if not media:
+    for page in pages:
+        params = {
+            "key": PIXABAY_API_KEY,
+            "q": query[:100],
+            "lang": "en",
+            "video_type": "film",
+            "safesearch": "true",
+            "order": "popular",
+            "page": page,
+            "per_page": 30,
+        }
+
+        r = requests.get(PIXABAY_SEARCH, params=params, timeout=30)
+        if not r.ok:
+            print(f"Pixabay {r.status_code}: {r.text[:200]}")
             continue
-        out.append({
-            "source": "pixabay",
-            "id": str(hit.get("id")),
-            "ref": f"pixabay:{hit.get('id')}",
-            "media_url": media.get("url"),
-            "page_url": hit.get("pageURL") or "https://pixabay.com/videos/",
-            "creator": hit.get("user") or "Pixabay creator",
-            "width": media.get("width") or 1,
-            "height": media.get("height") or 1,
-            "tags": hit.get("tags") or "",
-            "rank": rank,
-        })
-    return out
+
+        out = []
+        for rank, hit in enumerate(r.json().get("hits", [])[:24]):
+            media = choose_pixabay_mp4(hit)
+            if not media:
+                continue
+            out.append({
+                "source": "pixabay",
+                "id": str(hit.get("id")),
+                "ref": f"pixabay:{hit.get('id')}",
+                "media_url": media.get("url"),
+                "page_url": hit.get("pageURL") or "https://pixabay.com/videos/",
+                "creator": hit.get("user") or "Pixabay creator",
+                "width": media.get("width") or 1,
+                "height": media.get("height") or 1,
+                "tags": hit.get("tags") or "",
+                "rank": rank,
+            })
+
+        if out:
+            _PIXABAY_CACHE[cache_key] = out
+            return out
+
+    _PIXABAY_CACHE[cache_key] = []
+    return []
 
 
 def choose_pexels_mp4(video):
@@ -550,72 +671,58 @@ def choose_pixabay_mp4(hit):
     return max(candidates, key=score)
 
 
-def candidate_score(candidate, query: str):
-    rank = candidate.get("rank", 0)
-    score = max(0, 45 - rank * 3)
+def best_provider_candidate(query: str, query_type: str, scene_index: int, used_refs: set, used_sources: list[str]):
+    """
+    Cerca in entrambe le fonti. La fonte diversa vale solo pochi punti:
+    non può più battere una clip molto più pertinente.
+    """
+    candidates = search_pexels(query, scene_index) + search_pixabay(query, scene_index)
+    scored = []
+    previous_source = used_sources[-1] if used_sources else None
 
-    w = candidate.get("width") or 1
-    h = candidate.get("height") or 1
-    if h > w:
-        score += 18
+    for candidate in candidates:
+        if candidate.get("ref") in used_refs or not candidate.get("media_url"):
+            continue
 
-    haystack = (candidate.get("tags") or "").lower()
-    words = _query_words(query)
-    for word in words:
-        if word in haystack:
-            score += 9
+        semantic = candidate_semantic_score(candidate, query, query_type)
+        if semantic is None:
+            continue
 
-    if any(x in haystack for x in ["watch", "wrist", "timepiece", "orolog"]):
-        score += 35
+        # Varietà fonte = bonus piccolo, mai priorità principale.
+        if previous_source and candidate.get("source") != previous_source:
+            semantic += 4
 
-    return score
+        scored.append((semantic, candidate))
 
-
-def pick_from_source(candidates, query: str, used_refs: set, scene_index: int):
-    viable = [c for c in candidates if c.get("ref") not in used_refs and c.get("media_url")]
-    if not viable:
+    if not scored:
         return None
 
-    viable.sort(key=lambda c: (-candidate_score(c, query), c.get("rank", 0)))
-    shortlist = viable[:min(4, len(viable))]
+    scored.sort(key=lambda item: (-item[0], item[1].get("rank", 0)))
+
+    # V8: scegli tra le prime 2 SOLO se quasi equivalenti.
+    best_score = scored[0][0]
+    shortlist = [c for s, c in scored[:3] if best_score - s <= 8]
     idx = stable_number(
-        f"{SAFE_REQUEST_ID}:{query}:{scene_index}:{shortlist[0].get('source')}"
+        f"{SAFE_REQUEST_ID}:{scene_index}:{query}:semantic"
     ) % len(shortlist)
     return shortlist[idx]
 
 
-def choose_source_candidate(query: str, scene_index: int, used_refs: set, used_sources: list[str]):
-    pexels = search_pexels(query, scene_index)
-    pixabay = search_pixabay(query, scene_index)
+def choose_scene_candidate(entries, scene_index: int, used_refs: set, used_sources: list[str], used_queries: list[str], used_types: list[str]):
+    """
+    Prova soltanto query semanticamente valide per quella scena.
+    Se una query non produce clip affidabili, passa alla successiva DELLO STESSO TEMA.
+    """
+    ordered = order_scene_queries(entries, scene_index, used_queries, used_types)
 
-    p_pick = pick_from_source(pexels, query, used_refs, scene_index)
-    x_pick = pick_from_source(pixabay, query, used_refs, scene_index)
+    for query, query_type in ordered[:6]:
+        chosen = best_provider_candidate(
+            query, query_type, scene_index, used_refs, used_sources
+        )
+        if chosen:
+            return chosen, query, query_type
 
-    available = {"pexels": p_pick, "pixabay": x_pick}
-    available = {k: v for k, v in available.items() if v}
-    if not available:
-        return None
-
-    # Alternanza fonte: se entrambe sono disponibili, evita la fonte della scena precedente.
-    if len(available) == 2:
-        previous = used_sources[-1] if used_sources else None
-        preferred = "pixabay" if previous == "pexels" else "pexels"
-
-        # Il primo fotogramma cambia sorgente tra richieste diverse, così anche
-        # rigenerando lo stesso argomento non parte sempre dalla stessa libreria.
-        if previous is None:
-            preferred = "pixabay" if stable_number(SAFE_REQUEST_ID) % 2 else "pexels"
-
-        preferred_pick = available[preferred]
-        other_source = "pexels" if preferred == "pixabay" else "pixabay"
-        other_pick = available[other_source]
-
-        # Se la clip preferita è palesemente meno pertinente, usa l'altra.
-        if candidate_score(preferred_pick, query) + 22 < candidate_score(other_pick, query):
-            return other_pick
-        return preferred_pick
-
-    return next(iter(available.values()))
+    return None, None, None
 
 def download(url: str, dest: Path):
     with requests.get(url, stream=True, timeout=90) as r:
@@ -726,9 +833,10 @@ def main():
         scene_units = build_scene_plan(SCRIPT, total)
         durations = scene_durations(scene_units, total)
         manual_queries = [q.strip() for q in VISUAL_QUERIES.split(",") if q.strip()]
+        resolved_entries = resolve_scene_entries(scene_units)
 
         print(f"Scene automatiche: {len(scene_units)}")
-        print("2/5 Cerco visual coerenti su Pexels + Pixabay...")
+        print("2/5 Cerco visual pertinenti su Pexels + Pixabay...")
 
         raw_clips = []
         credits = []
@@ -740,28 +848,46 @@ def main():
 
         for scene_index, unit in enumerate(scene_units):
             if manual_queries:
+                # Modalità manuale: rispetta la query dell'utente, ma continua
+                # a filtrare i risultati che non sembrano affatto orologi.
                 query = manual_queries[scene_index % len(manual_queries)]
                 query_type = "manual"
-            else:
-                query, query_type = choose_query_for_scene(unit, scene_index, used_queries, used_types)
-
-            chosen = choose_source_candidate(
-                query, scene_index, used_refs, used_sources
-            )
-
-            if not chosen:
-                # Fallback: cambia anche famiglia visuale prima di arrendersi.
-                fallback_entries = [e for e in GENERIC_QUERIES if e[1] not in set(used_types[-2:])]
-                if not fallback_entries:
-                    fallback_entries = GENERIC_QUERIES
-                fallback_query, fallback_type = fallback_entries[scene_index % len(fallback_entries)]
-                chosen = choose_source_candidate(
-                    fallback_query, scene_index, used_refs, used_sources
+                chosen = best_provider_candidate(
+                    query, query_type, scene_index, used_refs, used_sources
                 )
-                query, query_type = fallback_query, fallback_type
+            else:
+                chosen, query, query_type = choose_scene_candidate(
+                    resolved_entries[scene_index],
+                    scene_index,
+                    used_refs,
+                    used_sources,
+                    used_queries,
+                    used_types,
+                )
 
             if not chosen:
-                raise RuntimeError(f"Nessun visual utilizzabile per la scena {scene_index + 1}")
+                # Ultimo fallback: resta comunque dentro il tema generale del video,
+                # NON usa più corona/diver/fondello a caso.
+                topic_entries = []
+                for entries in resolved_entries:
+                    for entry in entries:
+                        if entry not in topic_entries:
+                            topic_entries.append(entry)
+
+                chosen, query, query_type = choose_scene_candidate(
+                    topic_entries or GENERIC_QUERIES,
+                    scene_index,
+                    used_refs,
+                    used_sources,
+                    used_queries,
+                    used_types,
+                )
+
+            if not chosen:
+                raise RuntimeError(
+                    f"Nessun visual sufficientemente pertinente per la scena {scene_index + 1}. "
+                    "Meglio fermarsi che inserire una clip fuori tema."
+                )
 
             dest = work / f"raw_{scene_index}.mp4"
             download(chosen["media_url"], dest)
