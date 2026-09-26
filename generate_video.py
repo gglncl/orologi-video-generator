@@ -1,18 +1,38 @@
 import asyncio
 import hashlib
+import io
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import edge_tts
 import requests
+from PIL import Image
 
+try:
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+except Exception:
+    torch = None
+    CLIPModel = None
+    CLIPProcessor = None
+
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
 PEXELS_SEARCH = "https://api.pexels.com/v1/videos/search"
 PIXABAY_SEARCH = "https://pixabay.com/api/videos/"
+CLIP_MODEL_NAME = os.environ.get("CLIP_MODEL", "openai/clip-vit-base-patch32")
+
 OUT = Path("output")
 OUT.mkdir(exist_ok=True)
 
@@ -30,17 +50,22 @@ REQUEST_ID = os.environ.get("REQUEST_ID", "manual").strip()
 SAFE_REQUEST_ID = "".join(ch for ch in REQUEST_ID if ch.isalnum())[:40] or "manual"
 GIUSEPPE = "it-IT-GiuseppeMultilingualNeural"
 
-# V9: meno scene, ma molto più controllate. Meglio 8 clip coerenti
-# che 11 clip con 2-3 visual fuori tema.
-TARGET_SCENE_SECONDS = 4.0
-MIN_SCENES = 7
-MAX_SCENES = 9
+# 25-35 sec -> normalmente 5-7 scene. Niente scene duplicate create solo per riempire.
+TARGET_SCENE_SECONDS = 4.4
+MIN_SCENES = 5
+MAX_SCENES = 7
+
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "orologi-video-generator/10"})
 
 
+# -----------------------------------------------------------------------------
+# SHELL / AUDIO
+# -----------------------------------------------------------------------------
 def run(cmd):
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr[-5000:] or f"Comando fallito: {' '.join(cmd)}")
+        raise RuntimeError(proc.stderr[-6000:] or f"Comando fallito: {' '.join(cmd)}")
     return proc.stdout
 
 
@@ -52,8 +77,8 @@ def duration(path: Path) -> float:
     return max(0.1, float(out.strip()))
 
 
-async def _synth_once(text: str, out_mp3: Path, voice: str):
-    comm = edge_tts.Communicate(text, voice, rate=RATE, boundary="WordBoundary")
+async def _synth_once(text: str, out_mp3: Path):
+    comm = edge_tts.Communicate(text, GIUSEPPE, rate=RATE, boundary="WordBoundary")
     boundaries = []
     with out_mp3.open("wb") as f:
         async for chunk in comm.stream():
@@ -68,32 +93,22 @@ async def _synth_once(text: str, out_mp3: Path, voice: str):
     return boundaries
 
 
-def synthesize(text: str, out_mp3: Path, voice: str | None = None):
-    selected_voice = GIUSEPPE
+def synthesize(text: str, out_mp3: Path):
     last_error = None
-
     for attempt in range(1, 4):
         try:
             if out_mp3.exists():
                 out_mp3.unlink()
-
             boundaries = asyncio.run(
-                asyncio.wait_for(
-                    _synth_once(text, out_mp3, selected_voice),
-                    timeout=60,
-                )
+                asyncio.wait_for(_synth_once(text, out_mp3), timeout=75)
             )
-
             if not out_mp3.exists() or out_mp3.stat().st_size < 1000:
-                raise RuntimeError("TTS ha restituito un file vuoto.")
-
+                raise RuntimeError("TTS ha restituito un file vuoto")
             return boundaries
-
         except Exception as exc:
             last_error = exc
             print(f"TTS tentativo {attempt}/3 fallito: {exc}")
-
-    raise RuntimeError(f"TTS non riuscito dopo 3 tentativi: {last_error}")
+    raise RuntimeError(f"TTS non riuscito: {last_error}")
 
 
 def stable_number(value: str) -> int:
@@ -106,227 +121,229 @@ def clean_text(text: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# V9 — TEMI CHIUSI
-# Ogni argomento può usare solo famiglie visuali coerenti.
+# SEMANTIC PLANNER
 # -----------------------------------------------------------------------------
+# Ogni tipo visuale ha query molto strette. Evitiamo "watch" generico: quasi
+# tutte le query contengono wristwatch/watchmaker/mechanical wristwatch.
+TYPE_QUERIES = {
+    "generic": [
+        "real wristwatch close up",
+        "mechanical wristwatch on wrist close up",
+    ],
+    "dial": [
+        "wristwatch dial hands close up",
+        "mechanical wristwatch dial macro",
+    ],
+    "seconds": [
+        "wristwatch second hand dial close up",
+        "mechanical wristwatch seconds hand macro",
+    ],
+    "date_window": [
+        "wristwatch date window close up",
+        "mechanical wristwatch date display macro",
+    ],
+    "movement": [
+        "mechanical wristwatch movement gears macro",
+        "automatic wristwatch movement close up",
+    ],
+    "quartz_movement": [
+        "quartz wristwatch movement battery close up",
+        "quartz wristwatch mechanism close up",
+    ],
+    "crown": [
+        "wristwatch crown close up",
+        "hand adjusting wristwatch crown close up",
+    ],
+    "caseback": [
+        "wristwatch case back close up",
+        "mechanical wristwatch transparent caseback close up",
+    ],
+    "case": [
+        "stainless steel wristwatch case close up",
+        "mechanical wristwatch case macro",
+    ],
+    "wrist": [
+        "mechanical wristwatch on wrist close up",
+        "person wearing wristwatch close up",
+    ],
+    "watchmaker": [
+        "watchmaker repairing wristwatch close up",
+        "watchmaker working on mechanical wristwatch",
+    ],
+    "water": [
+        "wristwatch water splash close up",
+        "wristwatch wet water droplets close up",
+    ],
+    "diver": [
+        "diver wristwatch on wrist close up",
+        "diving wristwatch underwater close up",
+    ],
+    "bezel": [
+        "diver wristwatch bezel close up",
+        "wristwatch rotating bezel macro",
+    ],
+    "rotor": [
+        "automatic wristwatch rotor movement close up",
+        "mechanical wristwatch rotor macro",
+    ],
+    "strap": [
+        "wristwatch bracelet clasp close up",
+        "wristwatch leather strap close up",
+    ],
+    "chronograph": [
+        "chronograph wristwatch dial close up",
+        "chronograph wristwatch pushers close up",
+    ],
+    "store": [
+        "luxury wristwatch store display close up",
+        "wristwatch showcase store close up",
+    ],
+    "collection": [
+        "wristwatch collection close up",
+        "mechanical wristwatch collection display",
+    ],
+}
+
+TYPE_PROMPTS = {
+    "generic": "a close-up photo of a real wristwatch",
+    "dial": "a close-up photo of the dial and hands of a wristwatch",
+    "seconds": "a close-up photo of the seconds hand on a wristwatch dial",
+    "date_window": "a close-up photo of the date window on a wristwatch dial",
+    "movement": "a macro photo of a mechanical wristwatch movement with gears",
+    "quartz_movement": "a close-up photo of a quartz wristwatch movement and battery",
+    "crown": "a close-up photo of the crown on the side of a wristwatch",
+    "caseback": "a close-up photo of the back case of a wristwatch",
+    "case": "a close-up photo of the metal case of a wristwatch",
+    "wrist": "a photo of a wristwatch worn on a person's wrist",
+    "watchmaker": "a watchmaker repairing a wristwatch",
+    "water": "a wristwatch with water droplets or splashes on it",
+    "diver": "a diving wristwatch on a wrist or underwater",
+    "bezel": "a close-up photo of the bezel of a diving wristwatch",
+    "rotor": "a close-up photo of the automatic rotor inside a wristwatch movement",
+    "strap": "a close-up photo of a wristwatch strap bracelet or clasp",
+    "chronograph": "a close-up photo of a chronograph wristwatch dial and pushers",
+    "store": "wristwatches displayed inside a watch store",
+    "collection": "a collection of wristwatches",
+}
+
+NEGATIVE_PROMPTS = [
+    "an alarm clock",
+    "a wall clock",
+    "a clock tower",
+    "a digital desk clock",
+    "a smartwatch screen",
+    "a pocket watch",
+    "an hourglass",
+    "a kitchen timer",
+    "a phone screen",
+]
+
 THEMES = {
+    "date_setting": {
+        "types": ["date_window", "crown", "dial", "movement", "watchmaker"],
+        "fallback": ["date_window", "crown", "dial"],
+    },
     "crown_waterproof": {
-        "allowed_types": {"crown", "case", "caseback", "watchmaker", "wrist", "water"},
-        "queries": [
-            ("wristwatch crown close up", "crown"),
-            ("watchmaker adjusting wristwatch crown", "watchmaker"),
-            ("watchmaker inspecting wristwatch close up", "watchmaker"),
-            ("wristwatch case back close up", "caseback"),
-            ("stainless steel wristwatch case macro", "case"),
-            ("diver wristwatch on wrist close up", "wrist"),
-            ("wristwatch water splash close up", "water"),
-        ],
+        "types": ["crown", "caseback", "case", "water", "wrist", "diver", "watchmaker"],
+        "fallback": ["crown", "caseback", "water", "wrist"],
     },
     "water_resistance": {
-        "allowed_types": {"case", "caseback", "crown", "wrist", "water", "diver", "bezel", "watchmaker"},
-        "queries": [
-            ("wristwatch case back close up", "caseback"),
-            ("wristwatch crown close up", "crown"),
-            ("stainless steel wristwatch case macro", "case"),
-            ("wristwatch on wrist everyday close up", "wrist"),
-            ("wristwatch water splash close up", "water"),
-            ("diver wristwatch on wrist close up", "diver"),
-            ("diver watch bezel macro", "bezel"),
-            ("watchmaker inspecting wristwatch close up", "watchmaker"),
-        ],
+        "types": ["caseback", "case", "crown", "water", "wrist", "diver", "bezel"],
+        "fallback": ["caseback", "water", "wrist", "diver"],
     },
     "jewels": {
-        "allowed_types": {"movement", "watchmaker", "caseback"},
-        "queries": [
-            ("mechanical wristwatch ruby jewel movement macro", "movement"),
-            ("watch movement jewel close up", "movement"),
-            ("mechanical wristwatch movement gears macro", "movement"),
-            ("watchmaker mechanical movement ruby jewel", "watchmaker"),
-            ("watchmaker wristwatch movement close up", "watchmaker"),
-            ("transparent case back mechanical wristwatch", "caseback"),
-        ],
+        "types": ["movement", "watchmaker", "caseback", "rotor"],
+        "fallback": ["movement", "watchmaker"],
     },
-    "quartz_seconds": {
-        "allowed_types": {"dial", "movement", "wrist", "watchmaker"},
-        "queries": [
-            ("wristwatch dial second hand macro", "dial"),
-            ("wristwatch second hand close up", "dial"),
-            ("mechanical wristwatch dial close up", "dial"),
-            ("quartz wristwatch movement battery close up", "movement"),
-            ("mechanical wristwatch movement gears macro", "movement"),
-            ("mechanical wristwatch on wrist close up", "wrist"),
-            ("watchmaker inspecting wristwatch movement", "watchmaker"),
-        ],
+    "accuracy": {
+        "types": ["seconds", "dial", "movement", "wrist", "watchmaker"],
+        "fallback": ["seconds", "dial", "movement"],
+    },
+    "quartz_vs_mechanical": {
+        "types": ["seconds", "dial", "quartz_movement", "movement", "wrist"],
+        "fallback": ["seconds", "dial", "movement"],
     },
     "power_reserve": {
-        "allowed_types": {"movement", "crown", "wrist", "table", "watchmaker"},
-        "queries": [
-            ("automatic wristwatch rotor movement macro", "movement"),
-            ("mechanical wristwatch movement gears macro", "movement"),
-            ("hand winding mechanical wristwatch crown close up", "crown"),
-            ("mechanical wristwatch on wrist close up", "wrist"),
-            ("mechanical wristwatch on table close up", "table"),
-            ("watchmaker automatic movement close up", "watchmaker"),
-        ],
+        "types": ["rotor", "movement", "crown", "wrist", "watchmaker"],
+        "fallback": ["rotor", "movement", "crown"],
     },
     "investment": {
-        "allowed_types": {"store", "collection", "wrist", "case"},
-        "queries": [
-            ("luxury wristwatch store display close up", "store"),
-            ("wristwatch shopping display close up", "store"),
-            ("luxury mechanical wristwatch showcase", "store"),
-            ("wristwatch collection close up", "collection"),
-            ("luxury wristwatch on wrist close up", "wrist"),
-            ("premium wristwatch macro", "case"),
-        ],
+        "types": ["store", "collection", "wrist", "case"],
+        "fallback": ["store", "collection", "wrist"],
     },
     "chronograph": {
-        "allowed_types": {"dial", "pushers", "wrist", "case"},
-        "queries": [
-            ("chronograph wristwatch pushers close up", "pushers"),
-            ("chronograph watch dial macro", "dial"),
-            ("chronograph on wrist close up", "wrist"),
-            ("chronograph wristwatch case close up", "case"),
-        ],
+        "types": ["chronograph", "dial", "wrist", "case"],
+        "fallback": ["chronograph", "dial"],
     },
-    "bracelet": {
-        "allowed_types": {"bracelet", "wrist", "case", "watchmaker"},
-        "queries": [
-            ("wristwatch strap bracelet close up", "bracelet"),
-            ("watch bracelet clasp macro", "bracelet"),
-            ("wristwatch leather strap close up", "bracelet"),
-            ("mechanical wristwatch on wrist close up", "wrist"),
-            ("watchmaker changing watch strap close up", "watchmaker"),
-        ],
+    "strap": {
+        "types": ["strap", "wrist", "case", "watchmaker"],
+        "fallback": ["strap", "wrist"],
     },
     "maintenance": {
-        "allowed_types": {"watchmaker", "movement", "crown", "caseback", "case"},
-        "queries": [
-            ("watchmaker repairing wristwatch macro", "watchmaker"),
-            ("watchmaker hands watch movement close up", "watchmaker"),
-            ("mechanical wristwatch movement gears macro", "movement"),
-            ("mechanical wristwatch crown macro", "crown"),
-            ("wristwatch case back close up", "caseback"),
-            ("stainless steel wristwatch case macro", "case"),
-        ],
+        "types": ["watchmaker", "movement", "caseback", "crown", "case"],
+        "fallback": ["watchmaker", "movement"],
     },
-    "generic_watch": {
-        "allowed_types": {"dial", "movement", "wrist", "watchmaker", "case"},
-        "queries": [
-            ("wristwatch dial macro", "dial"),
-            ("mechanical wristwatch movement gears macro", "movement"),
-            ("mechanical wristwatch on wrist close up", "wrist"),
-            ("watchmaker hands wristwatch close up", "watchmaker"),
-            ("stainless steel wristwatch macro", "case"),
-        ],
+    "generic": {
+        "types": ["dial", "movement", "wrist", "watchmaker", "case"],
+        "fallback": ["dial", "movement", "wrist"],
     },
 }
 
-
-SCENE_HINTS = [
-    (["lancetta", "secondi", "quadrante", "precisione", "preciso", "scatto"], ["dial"]),
-    (["quarzo", "batteria", "movimento al quarzo"], ["movement", "dial"]),
-    (["movimento meccanico", "meccanico", "ingranaggi", "rotore", "molla", "rubini", "jewels"], ["movement", "watchmaker"]),
-    (["corona", "vite", "avvitata", "carica manuale"], ["crown", "watchmaker"]),
-    (["guarnizione", "guarnizioni", "cassa", "fondello"], ["caseback", "case", "watchmaker"]),
-    (["pioggia", "schizzi", "acqua", "bagn", "doccia"], ["water", "wrist", "case"]),
-    (["nuoto", "nuotare", "immersione", "subacqueo", "diver"], ["diver", "wrist", "bezel", "water"]),
-    (["polso", "indoss", "indossi"], ["wrist"]),
-    (["comodino", "tavolo", "fermo", "si ferma"], ["table", "movement"]),
-    (["prezzo", "valore", "mercato", "rivendita", "investimento", "listino"], ["store", "collection", "case"]),
-    (["orologiaio", "riparazione", "manutenzione", "assemblaggio"], ["watchmaker", "movement"]),
-    (["cinturino", "bracciale", "fibbie", "fibbia"], ["bracelet", "wrist"]),
-    (["cronografo", "pulsante", "pulsanti"], ["pushers", "dial", "wrist"]),
+SCENE_RULES = [
+    (r"\b(data|datario|giorno|mezzanotte|ore notturne)\b", ["date_window", "dial"]),
+    (r"\b(corona|vite|avvit|ricaric|carica manuale)\w*", ["crown", "watchmaker"]),
+    (r"\b(second|lancett|precision|anticip|ritard|scatt)\w*", ["seconds", "dial"]),
+    (r"\b(quarzo|batteria)\w*", ["quartz_movement", "seconds", "dial"]),
+    (r"\b(movimento|ingranagg|molla|bilancier|meccanismo|rubin|jewel)\w*", ["movement", "watchmaker"]),
+    (r"\b(rotore|massa oscillante|riserva di carica|energia accumulata)\b", ["rotor", "movement"]),
+    (r"\b(guarnizion|fondello|cassa)\w*", ["caseback", "case", "watchmaker"]),
+    (r"\b(acqua|pioggia|schizz|bagn|doccia|water resistant)\w*", ["water", "wrist", "case"]),
+    (r"\b(nuot|immersion|subacque|diver)\w*", ["diver", "water", "bezel", "wrist"]),
+    (r"\b(polso|indoss)\w*", ["wrist"]),
+    (r"\b(orologiaio|ripar|manutenz|assembl)\w*", ["watchmaker", "movement"]),
+    (r"\b(cinturino|bracciale|fibbia|fibbie)\b", ["strap", "wrist"]),
+    (r"\b(cronografo|pulsant)\w*", ["chronograph", "dial"]),
+    (r"\b(prezzo|valore|rivendita|mercato|investimento|listino)\w*", ["store", "collection", "wrist"]),
 ]
 
-
-# Risultati che NON vogliamo mai usare per questa pagina.
 BLOCKED_PHRASES = (
-    "alarm clock",
-    "alarm-clock",
-    "wall clock",
-    "wall-clock",
-    "clock tower",
-    "clock-tower",
-    "tower clock",
-    "tower-clock",
-    "grandfather clock",
-    "cuckoo clock",
-    "hourglass",
-    "sand timer",
-    "kitchen timer",
-    "kitchen clock",
-    "digital clock",
-    "desk clock",
-    "table clock",
-    "smartwatch",
-    "smart watch",
-    "apple watch",
-    "fitness tracker",
+    "alarm clock", "alarm-clock", "wall clock", "wall-clock", "clock tower",
+    "clock-tower", "tower clock", "grandfather clock", "cuckoo clock",
+    "hourglass", "sand timer", "kitchen timer", "desk clock", "table clock",
+    "digital clock", "smartwatch", "smart watch", "apple watch", "fitness tracker",
     "pocket watch",
 )
 
-POSITIVE_PATTERNS = (
-    r"\bwristwatch\b",
-    r"\bwrist\b",
-    r"\bwatchmaker\b",
-    r"\btimepiece\b",
-    r"\bchronograph\b",
-    r"\bwatch\b",
-)
-
-TYPE_SIGNALS = {
-    "dial": ("dial", "second", "hand", "face"),
-    "movement": ("movement", "gear", "rotor", "spring", "mechanism", "automatic", "mechanical"),
-    "watchmaker": ("watchmaker", "repair", "workshop", "tool"),
-    "crown": ("crown", "wind", "winding", "setting"),
-    "wrist": ("wrist", "wear", "wearing"),
-    "caseback": ("case back", "caseback", "rear", "back"),
-    "case": ("case", "steel", "stainless"),
-    "water": ("water", "splash", "rain", "wet"),
-    "diver": ("diver", "diving", "underwater"),
-    "bezel": ("bezel", "diver"),
-    "bracelet": ("bracelet", "strap", "clasp", "band"),
-    "pushers": ("pusher", "pushers", "chronograph", "button"),
-    "table": ("table", "desk", "bedside"),
-    "store": ("store", "shop", "display", "showcase"),
-    "collection": ("collection", "display", "watches"),
-}
-
-
-_PEXELS_CACHE = {}
-_PIXABAY_CACHE = {}
+WATCH_TERMS = ("wristwatch", "wrist watch", "watchmaker", "mechanical watch", "watch bracelet", "watch dial", "watch movement", "watch crown")
 
 
 def classify_theme(script: str) -> str:
     s = script.lower()
+    has = lambda *terms: any(t in s for t in terms)
 
-    has_water = any(k in s for k in [
-        "water resistant", "impermeabile", "impermeabilità", "acqua", "pioggia",
-        "schizzi", "nuoto", "nuotare", "immersione", "metri"
-    ])
-    has_crown = any(k in s for k in ["corona", "corona a vite", "vite"])
-
-    if has_water and has_crown:
+    if has("data", "datario", "mezzanotte") and has("corona", "movimento", "orologio"):
+        return "date_setting"
+    if has("water resistant", "impermeab", "acqua", "nuoto", "immersion", "metri") and has("corona"):
         return "crown_waterproof"
-    if has_water:
+    if has("water resistant", "impermeab", "acqua", "nuoto", "immersion", "metri"):
         return "water_resistance"
-    if any(k in s for k in ["21 jewels", "jewels", "rubini", "rubino"]):
+    if has("21 jewels", "jewels", "rubini", "rubino"):
         return "jewels"
-    if any(k in s for k in ["quarzo", "lancetta dei secondi", "secondi", "scatto al secondo"]):
-        return "quartz_seconds"
-    if any(k in s for k in ["riserva di carica", "si ferma", "comodino", "rotore", "molla", "energia accumulata"]):
+    if has("quarzo") and has("second", "lancetta", "meccanico", "automatico"):
+        return "quartz_vs_mechanical"
+    if has("anticipa", "ritarda", "precisione", "secondi al giorno", "magnetismo"):
+        return "accuracy"
+    if has("riserva di carica", "si ferma", "rotore", "massa oscillante", "energia accumulata"):
         return "power_reserve"
-    if any(k in s for k in ["investimento", "rivendita", "mercato dell'usato", "mercato usato", "prezzo di listino", "valore"]):
+    if has("investimento", "rivendita", "mercato dell'usato", "mercato usato", "prezzo di listino", "valore"):
         return "investment"
-    if any(k in s for k in ["cronografo", "pulsanti", "pulsante"]):
+    if has("cronografo", "pulsanti", "pulsante"):
         return "chronograph"
-    if any(k in s for k in ["cinturino", "bracciale", "fibbia", "fibbie"]):
-        return "bracelet"
-    if any(k in s for k in ["orologiaio", "riparazione", "manutenzione", "assemblaggio"]):
+    if has("cinturino", "bracciale", "fibbia", "fibbie"):
+        return "strap"
+    if has("orologiaio", "riparazione", "manutenzione", "assemblaggio"):
         return "maintenance"
-
-    return "generic_watch"
+    return "generic"
 
 
 def split_semantic_units(script: str):
@@ -334,424 +351,534 @@ def split_semantic_units(script: str):
     if not script:
         return []
 
-    pieces = re.split(
-        r"(?<=[.!?])\s+|;\s*|:\s*|,\s+(?=(?:ma|perché|quindi|quando|mentre|invece|oppure|però|e)\b)",
+    raw = re.split(
+        r"(?<=[.!?])\s+|;\s*|:\s*|,\s+(?=(?:ma|perché|quindi|quando|mentre|invece|oppure|però)\b)",
         script,
         flags=re.I,
     )
-    pieces = [clean_text(p) for p in pieces if len(clean_text(p)) >= 12]
+    units = [clean_text(x) for x in raw if len(clean_text(x)) >= 10]
 
-    result = []
-    for piece in pieces:
-        if len(piece) <= 110:
-            result.append(piece)
+    # Spezza solo frasi molto lunghe; non crea duplicati artificiali.
+    out = []
+    for unit in units:
+        words = unit.split()
+        if len(words) <= 24:
+            out.append(unit)
             continue
-
-        words = piece.split()
         mid = len(words) // 2
-        left = " ".join(words[:mid]).strip()
-        right = " ".join(words[mid:]).strip()
-        if len(left) >= 12 and len(right) >= 12:
-            result.extend([left, right])
-        else:
-            result.append(piece)
-
-    return result
+        out.extend([" ".join(words[:mid]), " ".join(words[mid:])])
+    return out or [script]
 
 
 def fit_scene_count(units, target_count):
-    units = [u for u in units if u]
+    units = list(units)
+
+    while len(units) > target_count and len(units) > 1:
+        idx = min(range(len(units) - 1), key=lambda i: len(units[i]) + len(units[i + 1]))
+        units[idx:idx + 2] = [clean_text(units[idx] + " " + units[idx + 1])]
 
     while len(units) < target_count:
-        idx = max(range(len(units)), key=lambda i: len(units[i]))
+        candidates = [(i, len(u.split())) for i, u in enumerate(units) if len(u.split()) >= 16]
+        if not candidates:
+            break
+        idx = max(candidates, key=lambda x: x[1])[0]
         words = units[idx].split()
-        if len(words) < 14:
-            break
         mid = len(words) // 2
-        left = " ".join(words[:mid]).strip()
-        right = " ".join(words[mid:]).strip()
-        if len(left) < 10 or len(right) < 10:
-            break
+        left, right = " ".join(words[:mid]), " ".join(words[mid:])
         units[idx:idx + 1] = [left, right]
-
-    while len(units) > target_count:
-        idx = min(
-            range(len(units) - 1),
-            key=lambda i: len(units[i]) + len(units[i + 1])
-        )
-        units[idx:idx + 2] = [units[idx] + " " + units[idx + 1]]
 
     return units
 
 
 def build_scene_plan(script: str, total_seconds: float):
-    target_count = round(total_seconds / TARGET_SCENE_SECONDS)
-    target_count = max(MIN_SCENES, min(MAX_SCENES, target_count))
-
-    units = split_semantic_units(script)
-    if not units:
-        units = [script]
-
-    units = fit_scene_count(units, target_count)
-
-    while len(units) < target_count:
-        units.append(units[len(units) % len(units)])
-
-    return units[:target_count]
+    target = round(total_seconds / TARGET_SCENE_SECONDS)
+    target = max(MIN_SCENES, min(MAX_SCENES, target))
+    return fit_scene_count(split_semantic_units(script), target)
 
 
 def scene_durations(scene_units, total_seconds: float):
-    base = total_seconds / len(scene_units)
-    durations = [base for _ in scene_units]
+    weights = [max(1, len(re.findall(r"\w+", u))) for u in scene_units]
+    total_weight = sum(weights)
+    durations = [total_seconds * w / total_weight for w in weights]
+
+    # Evita clip troppo lampo; riequilibra senza cambiare il totale.
+    minimum = 2.7
+    for _ in range(3):
+        short = [i for i, d in enumerate(durations) if d < minimum]
+        if not short:
+            break
+        deficit = sum(minimum - durations[i] for i in short)
+        for i in short:
+            durations[i] = minimum
+        donors = [i for i, d in enumerate(durations) if d > minimum + 0.5 and i not in short]
+        donor_space = sum(durations[i] - minimum for i in donors)
+        if donor_space <= 0:
+            break
+        for i in donors:
+            take = deficit * ((durations[i] - minimum) / donor_space)
+            durations[i] -= take
+
+    scale = total_seconds / sum(durations)
+    durations = [d * scale for d in durations]
     durations[-1] += total_seconds - sum(durations)
     return durations
 
 
-def preferred_types_for_sentence(sentence: str):
+def types_for_scene(theme: str, sentence: str, used_types: list[str]):
+    allowed = THEMES[theme]["types"]
+    found = []
     s = sentence.lower()
-    out = []
 
-    for keywords, types in SCENE_HINTS:
-        if any(k in s for k in keywords):
+    for pattern, types in SCENE_RULES:
+        if re.search(pattern, s, flags=re.I):
             for t in types:
-                if t not in out:
-                    out.append(t)
+                if t in allowed and t not in found:
+                    found.append(t)
 
-    return out
+    # Se la frase è generica, usa tipi del tema e bilancia davvero la varietà.
+    counts = Counter(used_types)
+    for t in sorted(allowed, key=lambda x: (counts[x], x in used_types[-2:], stable_number(f"{SAFE_REQUEST_ID}:{sentence}:{x}") % 997)):
+        if t not in found:
+            found.append(t)
 
-
-def ordered_theme_entries(theme_name: str, sentence: str, scene_index: int, used_queries: list[str], used_types: list[str]):
-    theme = THEMES[theme_name]
-    allowed = theme["allowed_types"]
-    entries = [e for e in theme["queries"] if e[1] in allowed]
-
-    hints = preferred_types_for_sentence(sentence)
-    recent_queries = set(used_queries[-3:])
-    recent_types = set(used_types[-2:])
-
-    def key(entry):
-        query, query_type = entry
-        relevance = hints.index(query_type) if query_type in hints else 99
-        repeat_penalty = 0
-        if query in recent_queries:
-            repeat_penalty += 5
-        if query_type in recent_types:
-            repeat_penalty += 2
-        if query in used_queries:
-            repeat_penalty += 1
-        tie = stable_number(f"{SAFE_REQUEST_ID}:{scene_index}:{query}") % 1000
-        return (relevance, repeat_penalty, tie)
-
-    return sorted(entries, key=key)
+    return found[:4]
 
 
-def _query_words(query: str):
-    return [
-        w for w in re.findall(r"[a-z]+", query.lower())
-        if len(w) >= 4 and w not in {
-            "close", "macro", "mechanical", "automatic", "wristwatch", "watch",
-            "luxury", "steel", "person", "stainless"
-        }
-    ]
+# -----------------------------------------------------------------------------
+# STOCK SOURCES
+# -----------------------------------------------------------------------------
+@dataclass
+class Candidate:
+    source: str
+    id: str
+    ref: str
+    media_url: str
+    thumb_url: str
+    page_url: str
+    creator: str
+    width: int
+    height: int
+    tags: str
+    rank: int
+    query: str
 
 
-def metadata_text(candidate):
-    return f"{candidate.get('tags') or ''} {candidate.get('page_url') or ''}".lower()
-
-
-def blocked_candidate(candidate) -> bool:
-    haystack = metadata_text(candidate)
-    return any(phrase in haystack for phrase in BLOCKED_PHRASES)
-
-
-def has_watch_signal(candidate) -> bool:
-    haystack = metadata_text(candidate)
-    return any(re.search(pattern, haystack) for pattern in POSITIVE_PATTERNS)
-
-
-def candidate_score(candidate, query: str, query_type: str, allow_reuse: bool):
-    if blocked_candidate(candidate):
-        return None
-
-    if not has_watch_signal(candidate):
-        return None
-
-    score = 100
-    rank = int(candidate.get("rank", 0))
-    score += max(0, 28 - rank * 2)
-
-    w = candidate.get("width") or 1
-    h = candidate.get("height") or 1
-    if h > w:
-        score += 10
-
-    haystack = metadata_text(candidate)
-
-    # Parole della query: forte segnale di pertinenza.
-    query_matches = 0
-    for word in _query_words(query):
-        if word in haystack:
-            score += 12
-            query_matches += 1
-
-    # Tipo visuale atteso.
-    type_matches = 0
-    for word in TYPE_SIGNALS.get(query_type, ()):
-        if word in haystack:
-            score += 14
-            type_matches += 1
-
-    # Se i metadati sono generici, la clip resta utilizzabile ma non supera
-    # una clip che conferma davvero il tipo richiesto.
-    if query_matches == 0 and type_matches == 0:
-        score -= 18
-
-    if allow_reuse:
-        score -= 22
-
-    return score
-
-
-def search_pexels(query: str, scene_index: int):
-    if not PEXELS_API_KEY:
-        return []
-
-    cache_key = (query, scene_index % 2)
-    if cache_key in _PEXELS_CACHE:
-        return _PEXELS_CACHE[cache_key]
-
-    first_page = 1 if scene_index % 2 == 0 else 2
-    pages = [first_page, 2 if first_page == 1 else 1]
-
-    all_results = []
-
-    for page in pages:
-        base = {
-            "query": query,
-            "size": "medium",
-            "per_page": 30,
-            "page": page,
-            "locale": "en-US",
-        }
-
-        for params in ({**base, "orientation": "portrait"}, base):
-            r = requests.get(
-                PEXELS_SEARCH,
-                headers={"Authorization": PEXELS_API_KEY},
-                params=params,
-                timeout=30,
-            )
-
-            if not r.ok:
-                print(f"Pexels {r.status_code}: {r.text[:200]}")
-                continue
-
-            for rank, video in enumerate(r.json().get("videos", [])[:20]):
-                media = choose_pexels_mp4(video)
-                if not media:
-                    continue
-
-                all_results.append({
-                    "source": "pexels",
-                    "id": str(video.get("id")),
-                    "ref": f"pexels:{video.get('id')}",
-                    "media_url": media.get("link"),
-                    "page_url": video.get("url") or "https://www.pexels.com",
-                    "creator": (video.get("user") or {}).get("name", "Pexels creator"),
-                    "width": video.get("width") or media.get("width") or 1,
-                    "height": video.get("height") or media.get("height") or 1,
-                    "tags": str(video.get("url") or ""),
-                    "rank": rank + (page - 1) * 20,
-                })
-
-    # Dedupe ref mantenendo il primo risultato.
-    deduped = []
-    seen = set()
-    for item in all_results:
-        if item["ref"] in seen:
-            continue
-        seen.add(item["ref"])
-        deduped.append(item)
-
-    _PEXELS_CACHE[cache_key] = deduped
-    return deduped
-
-
-def search_pixabay(query: str, scene_index: int):
-    if not PIXABAY_API_KEY:
-        return []
-
-    cache_key = (query, scene_index % 2)
-    if cache_key in _PIXABAY_CACHE:
-        return _PIXABAY_CACHE[cache_key]
-
-    preferred_page = 1 if scene_index % 2 == 0 else 2
-    pages = [preferred_page, 2 if preferred_page == 1 else 1]
-    all_results = []
-
-    for page in pages:
-        params = {
-            "key": PIXABAY_API_KEY,
-            "q": query[:100],
-            "lang": "en",
-            "video_type": "film",
-            "safesearch": "true",
-            "order": "popular",
-            "page": page,
-            "per_page": 30,
-        }
-
-        r = requests.get(PIXABAY_SEARCH, params=params, timeout=30)
-        if not r.ok:
-            print(f"Pixabay {r.status_code}: {r.text[:200]}")
-            continue
-
-        for rank, hit in enumerate(r.json().get("hits", [])[:24]):
-            media = choose_pixabay_mp4(hit)
-            if not media:
-                continue
-
-            all_results.append({
-                "source": "pixabay",
-                "id": str(hit.get("id")),
-                "ref": f"pixabay:{hit.get('id')}",
-                "media_url": media.get("url"),
-                "page_url": hit.get("pageURL") or "https://pixabay.com/videos/",
-                "creator": hit.get("user") or "Pixabay creator",
-                "width": media.get("width") or 1,
-                "height": media.get("height") or 1,
-                "tags": hit.get("tags") or "",
-                "rank": rank + (page - 1) * 24,
-            })
-
-    deduped = []
-    seen = set()
-    for item in all_results:
-        if item["ref"] in seen:
-            continue
-        seen.add(item["ref"])
-        deduped.append(item)
-
-    _PIXABAY_CACHE[cache_key] = deduped
-    return deduped
+_PEXELS_CACHE = {}
+_PIXABAY_CACHE = {}
 
 
 def choose_pexels_mp4(video):
-    candidates = [
-        f for f in video.get("video_files", [])
-        if f.get("file_type") == "video/mp4" and f.get("link")
-    ]
-
-    if not candidates:
+    files = [f for f in video.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("link")]
+    if not files:
         return None
 
     def score(f):
-        w = f.get("width") or 1
-        h = f.get("height") or 1
-        portrait = 1 if h >= w else 0
-        ratio_penalty = abs((w / h) - (9 / 16))
-        pixels = min(w * h, 1080 * 1920) / (1080 * 1920)
-        return portrait * 20 + pixels * 2 - ratio_penalty
+        w, h = f.get("width") or 1, f.get("height") or 1
+        portrait_bonus = 10 if h >= w else 0
+        target_pixels = min(w * h, 1080 * 1920) / (1080 * 1920)
+        return portrait_bonus + target_pixels
 
-    return max(candidates, key=score)
+    return max(files, key=score)
 
 
 def choose_pixabay_mp4(hit):
     videos = hit.get("videos") or {}
-    candidates = []
-
+    items = []
     for name in ("medium", "large", "small", "tiny"):
-        item = videos.get(name) or {}
-        if item.get("url"):
-            candidates.append(item)
-
-    if not candidates:
+        v = videos.get(name) or {}
+        if v.get("url"):
+            items.append(v)
+    if not items:
         return None
 
-    def score(item):
-        w = item.get("width") or 1
-        h = item.get("height") or 1
-        portrait = 1 if h >= w else 0
-        ratio_penalty = abs((w / h) - (9 / 16))
-        pixels = min(w * h, 1080 * 1920) / (1080 * 1920)
-        return portrait * 20 + pixels * 2 - ratio_penalty
+    def score(v):
+        w, h = v.get("width") or 1, v.get("height") or 1
+        return (8 if h >= w else 0) + min(w * h, 1080 * 1920) / (1080 * 1920)
 
-    return max(candidates, key=score)
+    return max(items, key=score)
 
 
-def best_candidate_for_query(query: str, query_type: str, scene_index: int, used_refs: set, used_sources: list[str], allow_reuse=False):
-    candidates = search_pexels(query, scene_index) + search_pixabay(query, scene_index)
-    previous_source = used_sources[-1] if used_sources else None
-    scored = []
+def blocked_text(text: str) -> bool:
+    t = (text or "").lower()
+    return any(x in t for x in BLOCKED_PHRASES)
 
-    for candidate in candidates:
-        already_used = candidate.get("ref") in used_refs
-        if already_used and not allow_reuse:
-            continue
 
-        score = candidate_score(candidate, query, query_type, allow_reuse=already_used)
-        if score is None:
-            continue
+def search_pexels(query: str):
+    if not PEXELS_API_KEY:
+        return []
+    if query in _PEXELS_CACHE:
+        return _PEXELS_CACHE[query]
 
-        # Fonte diversa è solo un piccolo bonus. Non può battere la pertinenza.
-        if previous_source and candidate.get("source") != previous_source:
+    results = []
+    seen = set()
+
+    # Prima portrait, poi senza vincolo. Solo prima pagina: pertinenza > quantità.
+    variants = [
+        {"query": query, "orientation": "portrait", "size": "medium", "per_page": 14, "page": 1, "locale": "en-US"},
+        {"query": query, "size": "medium", "per_page": 14, "page": 1, "locale": "en-US"},
+    ]
+
+    for params in variants:
+        try:
+            r = HTTP.get(PEXELS_SEARCH, headers={"Authorization": PEXELS_API_KEY}, params=params, timeout=25)
+            if not r.ok:
+                print(f"Pexels {r.status_code}: {r.text[:160]}")
+                continue
+            for rank, video in enumerate(r.json().get("videos", [])[:12]):
+                vid = str(video.get("id"))
+                if not vid or vid in seen:
+                    continue
+                media = choose_pexels_mp4(video)
+                thumb = video.get("image")
+                if not thumb and video.get("video_pictures"):
+                    thumb = video["video_pictures"][0].get("picture")
+                if not media or not thumb:
+                    continue
+                page_url = video.get("url") or "https://www.pexels.com"
+                if blocked_text(page_url):
+                    continue
+                seen.add(vid)
+                results.append(Candidate(
+                    source="pexels",
+                    id=vid,
+                    ref=f"pexels:{vid}",
+                    media_url=media["link"],
+                    thumb_url=thumb,
+                    page_url=page_url,
+                    creator=(video.get("user") or {}).get("name", "Pexels creator"),
+                    width=int(video.get("width") or media.get("width") or 1),
+                    height=int(video.get("height") or media.get("height") or 1),
+                    tags="",
+                    rank=rank,
+                    query=query,
+                ))
+        except Exception as exc:
+            print(f"Errore Pexels: {exc}")
+
+    _PEXELS_CACHE[query] = results
+    return results
+
+
+def search_pixabay(query: str):
+    if not PIXABAY_API_KEY:
+        return []
+    if query in _PIXABAY_CACHE:
+        return _PIXABAY_CACHE[query]
+
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": query[:100],
+        "lang": "en",
+        "video_type": "film",
+        "safesearch": "true",
+        "order": "popular",
+        "page": 1,
+        "per_page": 24,
+    }
+
+    results = []
+    try:
+        r = HTTP.get(PIXABAY_SEARCH, params=params, timeout=25)
+        if not r.ok:
+            print(f"Pixabay {r.status_code}: {r.text[:160]}")
+            _PIXABAY_CACHE[query] = []
+            return []
+
+        for rank, hit in enumerate(r.json().get("hits", [])[:18]):
+            media = choose_pixabay_mp4(hit)
+            if not media:
+                continue
+            tags = str(hit.get("tags") or "")
+            page_url = hit.get("pageURL") or "https://pixabay.com/videos/"
+            combined = f"{tags} {page_url}".lower()
+            if blocked_text(combined):
+                continue
+
+            # Pixabay ha tag veri: se parla chiaramente di clock ma non di watch,
+            # scartiamo prima ancora del controllo visivo.
+            if "clock" in combined and not any(t in combined for t in ("watch", "wrist", "timepiece")):
+                continue
+
+            thumb = media.get("thumbnail")
+            if not thumb:
+                continue
+
+            vid = str(hit.get("id"))
+            results.append(Candidate(
+                source="pixabay",
+                id=vid,
+                ref=f"pixabay:{vid}",
+                media_url=media["url"],
+                thumb_url=thumb,
+                page_url=page_url,
+                creator=hit.get("user") or "Pixabay creator",
+                width=int(media.get("width") or 1),
+                height=int(media.get("height") or 1),
+                tags=tags,
+                rank=rank,
+                query=query,
+            ))
+    except Exception as exc:
+        print(f"Errore Pixabay: {exc}")
+
+    _PIXABAY_CACHE[query] = results
+    return results
+
+
+# -----------------------------------------------------------------------------
+# VISUAL VALIDATOR (CLIP)
+# -----------------------------------------------------------------------------
+class VisualValidator:
+    def __init__(self):
+        self.available = False
+        self.model = None
+        self.processor = None
+        self.text_cache = {}
+        self.image_cache = {}
+        self.image_obj_cache = {}
+
+        if not torch or not CLIPModel or not CLIPProcessor:
+            print("CLIP non disponibile: userò fallback metadata molto conservativo")
+            return
+
+        try:
+            print(f"Carico controllo visuale AI: {CLIP_MODEL_NAME}")
+            self.model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
+            self.processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+            self.model.eval()
+            self.available = True
+            print("Controllo visuale AI pronto")
+        except Exception as exc:
+            print(f"CLIP non caricabile ({exc}). Fallback conservativo attivo")
+
+    def _text_embeddings(self, prompts):
+        key = tuple(prompts)
+        if key in self.text_cache:
+            return self.text_cache[key]
+
+        inputs = self.processor(text=list(prompts), return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():
+            feats = self.model.get_text_features(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
+            )
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        self.text_cache[key] = feats.cpu()
+        return self.text_cache[key]
+
+    def _download_image(self, candidate: Candidate):
+        if candidate.ref in self.image_obj_cache:
+            return self.image_obj_cache[candidate.ref]
+        try:
+            r = HTTP.get(candidate.thumb_url, timeout=20)
+            r.raise_for_status()
+            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            self.image_obj_cache[candidate.ref] = img
+            return img
+        except Exception as exc:
+            print(f"Thumbnail fallita {candidate.ref}: {exc}")
+            return None
+
+    def embeddings_for(self, candidates):
+        out = {}
+        if not self.available:
+            return out
+
+        missing = [c for c in candidates if c.ref not in self.image_cache]
+        valid = []
+        images = []
+        for c in missing:
+            img = self._download_image(c)
+            if img is not None:
+                valid.append(c)
+                images.append(img)
+
+        if images:
+            inputs = self.processor(images=images, return_tensors="pt")
+            with torch.no_grad():
+                feats = self.model.get_image_features(pixel_values=inputs["pixel_values"])
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            for c, feat in zip(valid, feats.cpu()):
+                self.image_cache[c.ref] = feat
+
+        for c in candidates:
+            if c.ref in self.image_cache:
+                out[c.ref] = self.image_cache[c.ref]
+        return out
+
+    def metadata_fallback_score(self, c: Candidate, visual_type: str):
+        hay = f"{c.tags} {c.page_url}".lower()
+        if blocked_text(hay):
+            return None
+
+        # Pixabay: usa i tag veri. Pexels non fornisce title/tags via API, quindi
+        # senza CLIP accettiamo solo URL che sembrano esplicitamente da polso.
+        if c.source == "pixabay":
+            if not any(x in hay for x in ("watch", "wrist", "timepiece", "watchmaker")):
+                return None
+        else:
+            if not any(x in hay for x in ("watch", "wrist", "watchmaker", "timepiece")):
+                return None
+
+        score = 40.0
+        words = [w for w in re.findall(r"[a-z]+", " ".join(TYPE_QUERIES.get(visual_type, []))) if len(w) > 4]
+        score += sum(2.5 for w in set(words) if w in hay)
+        if c.height > c.width:
             score += 3
+        score -= c.rank * 0.3
+        return score
 
-        scored.append((score, candidate))
+    def rank(self, candidates, visual_type: str, used_embeddings, used_refs):
+        # Dedupe + filtri base.
+        unique = []
+        seen = set()
+        for c in candidates:
+            if c.ref in seen or c.ref in used_refs:
+                continue
+            seen.add(c.ref)
+            if blocked_text(f"{c.tags} {c.page_url}"):
+                continue
+            unique.append(c)
 
-    if not scored:
-        return None
+        if not unique:
+            return []
 
-    scored.sort(key=lambda item: (-item[0], item[1].get("rank", 0)))
+        if not self.available:
+            ranked = []
+            for c in unique:
+                score = self.metadata_fallback_score(c, visual_type)
+                if score is not None:
+                    ranked.append((score, c, None, {"mode": "metadata"}))
+            return sorted(ranked, key=lambda x: -x[0])
 
-    # Scegli tra le prime clip solo se il punteggio è quasi identico.
-    best_score = scored[0][0]
-    shortlist = [c for s, c in scored[:3] if best_score - s <= 5]
-    idx = stable_number(f"{SAFE_REQUEST_ID}:{scene_index}:{query}:v9") % len(shortlist)
-    return shortlist[idx]
+        emb_map = self.embeddings_for(unique)
+        prompts = [
+            TYPE_PROMPTS.get(visual_type, "a close-up photo of a wristwatch"),
+            "a close-up photo of a real wristwatch",
+            *NEGATIVE_PROMPTS,
+        ]
+        text_embs = self._text_embeddings(prompts)
+
+        ranked = []
+        for c in unique:
+            emb = emb_map.get(c.ref)
+            if emb is None:
+                continue
+
+            sims = torch.matmul(text_embs, emb).numpy().tolist()
+            specific = float(sims[0])
+            generic_watch = float(sims[1])
+            best_positive = max(specific, generic_watch)
+            best_negative = max(float(x) for x in sims[2:])
+            margin = best_positive - best_negative
+
+            hay = f"{c.tags} {c.page_url}".lower()
+            metadata_watch = any(x in hay for x in ("watch", "wrist", "timepiece", "watchmaker"))
+
+            # Regola centrale V10: una clip che CLIP vede più simile a sveglia,
+            # wall clock, smartwatch ecc. non entra. Pixabay con tag chiaramente
+            # da orologio ha una piccola tolleranza, Pexels no.
+            tolerance = -0.012 if (c.source == "pixabay" and metadata_watch) else -0.002
+            if margin < tolerance:
+                continue
+
+            score = margin * 120.0 + specific * 18.0 + generic_watch * 8.0
+            if c.height > c.width:
+                score += 2.5
+            score += max(0, 3.0 - c.rank * 0.25)
+            if c.source == "pixabay" and metadata_watch:
+                score += 2.0
+
+            max_similarity = 0.0
+            if used_embeddings:
+                max_similarity = max(float(torch.dot(emb, old).item()) for old in used_embeddings)
+                if max_similarity > 0.965:
+                    score -= 18.0
+                elif max_similarity > 0.92:
+                    score -= 8.0
+                elif max_similarity > 0.86:
+                    score -= 3.0
+
+            audit = {
+                "specific_similarity": round(specific, 4),
+                "watch_similarity": round(generic_watch, 4),
+                "negative_similarity": round(best_negative, 4),
+                "margin": round(margin, 4),
+                "similarity_to_previous": round(max_similarity, 4),
+                "mode": "clip",
+            }
+            ranked.append((score, c, emb, audit))
+
+        ranked.sort(key=lambda x: -x[0])
+        return ranked
 
 
-def choose_scene_candidate(theme_name: str, sentence: str, scene_index: int, used_refs: set, used_sources: list[str], used_queries: list[str], used_types: list[str]):
-    entries = ordered_theme_entries(
-        theme_name,
-        sentence,
-        scene_index,
-        used_queries,
-        used_types,
-    )
-
-    # Primo passaggio: solo clip nuove e pertinenti.
-    for query, query_type in entries:
-        chosen = best_candidate_for_query(
-            query,
-            query_type,
-            scene_index,
-            used_refs,
-            used_sources,
-            allow_reuse=False,
-        )
-        if chosen:
-            return chosen, query, query_type, False
-
-    # Secondo passaggio: meglio RIUSARE una clip pertinente che inserire
-    # una sveglia o un visual fuori tema.
-    for query, query_type in entries:
-        chosen = best_candidate_for_query(
-            query,
-            query_type,
-            scene_index,
-            used_refs,
-            used_sources,
-            allow_reuse=True,
-        )
-        if chosen:
-            return chosen, query, query_type, True
-
-    return None, None, None, False
+# -----------------------------------------------------------------------------
+# CANDIDATE SEARCH + SELECTION
+# -----------------------------------------------------------------------------
+def candidates_for_type(visual_type: str, manual_query: Optional[str] = None):
+    queries = [manual_query] if manual_query else TYPE_QUERIES.get(visual_type, TYPE_QUERIES["dial"])
+    candidates = []
+    for q in queries[:2]:
+        candidates.extend(search_pixabay(q))
+        candidates.extend(search_pexels(q))
+    return candidates
 
 
+def choose_for_scene(
+    validator: VisualValidator,
+    theme: str,
+    sentence: str,
+    scene_index: int,
+    used_types: list[str],
+    used_refs: set,
+    used_embeddings: list,
+    selected_history: list,
+    manual_query: Optional[str] = None,
+):
+    if manual_query:
+        visual_types = ["generic"]
+    else:
+        visual_types = types_for_scene(theme, sentence, used_types)
+
+    attempts = []
+    for visual_type in visual_types:
+        cands = candidates_for_type(visual_type, manual_query=manual_query)
+        ranked = validator.rank(cands, visual_type, used_embeddings, used_refs)
+        attempts.append({"type": visual_type, "candidates": len(cands), "valid": len(ranked)})
+        if ranked:
+            score, candidate, emb, audit = ranked[0]
+            return candidate, visual_type, emb, audit, attempts, False
+
+    # Secondo giro: fallback SOLO nel tema corrente.
+    for visual_type in THEMES[theme]["fallback"]:
+        if visual_type in visual_types:
+            continue
+        cands = candidates_for_type(visual_type)
+        ranked = validator.rank(cands, visual_type, used_embeddings, used_refs)
+        attempts.append({"type": visual_type, "candidates": len(cands), "valid": len(ranked), "fallback": True})
+        if ranked:
+            score, candidate, emb, audit = ranked[0]
+            return candidate, visual_type, emb, audit, attempts, False
+
+    # Ultima sicurezza: riutilizza una clip GIÀ VALIDATA e coerente col tema.
+    # È preferibile a inserire una sveglia o un visual scollegato.
+    allowed = set(THEMES[theme]["types"])
+    compatible = [x for x in reversed(selected_history) if x["visual_type"] in allowed]
+    if compatible:
+        best = compatible[0]
+        audit = dict(best["audit"])
+        audit["mode"] = "validated_reuse"
+        return best["candidate"], best["visual_type"], best["embedding"], audit, attempts, True
+
+    raise RuntimeError(f"Nessuna clip affidabile trovata per la scena {scene_index + 1}")
+
+
+# -----------------------------------------------------------------------------
+# VIDEO RENDER
+# -----------------------------------------------------------------------------
 def download(url: str, dest: Path):
-    with requests.get(url, stream=True, timeout=90) as r:
+    with HTTP.get(url, stream=True, timeout=90) as r:
         r.raise_for_status()
         with dest.open("wb") as f:
             for chunk in r.iter_content(1024 * 512):
@@ -759,21 +886,23 @@ def download(url: str, dest: Path):
                     f.write(chunk)
 
 
-def normalize_clip(src: Path, dst: Path, seconds: float, scene_index: int, reused=False):
-    # Crop leggermente diverso in caso di clip riutilizzata.
-    if reused:
-        scale_w = 1180 if scene_index % 2 == 0 else 1220
-        scale_h = 2098 if scene_index % 2 == 0 else 2169
-    else:
-        scale_w = 1100 if scene_index % 2 == 0 else 1140
-        scale_h = 1956 if scene_index % 2 == 0 else 2027
+def normalize_clip(src: Path, dst: Path, seconds: float, scene_index: int, reused: bool):
+    # Se una clip validata viene riusata, cambiamo leggermente crop/zoom per non
+    # far sembrare un duplicato identico. Nessun effetto aggressivo.
+    extra = 1.03 if reused else (1.00 + (scene_index % 3) * 0.008)
+    w = int(1080 * extra)
+    h = int(1920 * extra)
 
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        "fps=30,"
+        "eq=contrast=1.02:saturation=0.98"
+    )
     run([
         "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(src),
         "-t", f"{seconds:.3f}",
-        "-vf",
-        f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,fps=30,eq=contrast=1.03:saturation=0.97",
+        "-vf", vf,
         "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
         "-pix_fmt", "yuv420p", str(dst),
     ])
@@ -792,18 +921,14 @@ def esc(text: str) -> str:
 
 
 def caption_groups(boundaries, n=4):
-    out = []
-    group = []
-
+    out, group = [], []
     for item in boundaries:
         group.append(item)
         if len(group) == n:
             out.append((group[0]["start"], group[-1]["end"], " ".join(x["text"] for x in group)))
             group = []
-
     if group:
         out.append((group[0]["start"], group[-1]["end"], " ".join(x["text"] for x in group)))
-
     return out
 
 
@@ -822,181 +947,150 @@ Style: Captions,DejaVu Sans,58,&H00FFFFFF,&H000000FF,&H00101010,&H66000000,-1,0,
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-
     lines = [header]
     for start, end, text in caption_groups(boundaries, 4):
         end = max(end, start + 0.45)
-        lines.append(
-            f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Captions,,0,0,0,,{esc(text)}\n"
-        )
-
+        lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Captions,,0,0,0,,{esc(text)}\n")
     path.write_text("".join(lines), encoding="utf-8")
 
 
-def write_meta(kind: str, status: str, extra: dict | None = None):
-    data = {
-        "request_id": SAFE_REQUEST_ID,
-        "kind": kind,
-        "status": status,
-    }
-
+def write_meta(kind: str, status: str, extra=None):
+    data = {"request_id": SAFE_REQUEST_ID, "kind": kind, "status": status}
     if extra:
         data.update(extra)
-
-    (OUT / "result.json").write_text(
-        json.dumps(data, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    (OUT / "result.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 def main():
     if MODE == "deploy_only":
         write_meta("deploy_only", "ok")
         return
 
     if not SCRIPT:
-        raise SystemExit("SCRIPT mancante.")
+        raise SystemExit("SCRIPT mancante")
 
     if MODE == "test_voice":
-        sample = SCRIPT[:320]
         filename = f"voice_test_{SAFE_REQUEST_ID}.mp3"
         dest = OUT / filename
-        synthesize(sample, dest, voice=GIUSEPPE)
+        synthesize(SCRIPT[:320], dest)
         write_meta("test_voice", "ok", {"file": filename})
         return
 
     if not PEXELS_API_KEY and not PIXABAY_API_KEY:
-        raise SystemExit("Serve almeno una chiave tra PEXELS_API_KEY e PIXABAY_API_KEY.")
+        raise SystemExit("Serve almeno una chiave tra PEXELS_API_KEY e PIXABAY_API_KEY")
 
-    work = Path(tempfile.mkdtemp(prefix="watchvideo_"))
-
+    work = Path(tempfile.mkdtemp(prefix="watchvideo_v10_"))
     try:
-        print("1/5 Creo la voce...")
+        print("1/6 Creo la voce...")
         voice_mp3 = work / "voice.mp3"
-        boundaries = synthesize(SCRIPT, voice_mp3, voice=GIUSEPPE)
+        boundaries = synthesize(SCRIPT, voice_mp3)
         total = duration(voice_mp3)
 
-        theme_name = classify_theme(SCRIPT)
+        theme = classify_theme(SCRIPT)
         scene_units = build_scene_plan(SCRIPT, total)
         durations = scene_durations(scene_units, total)
         manual_queries = [q.strip() for q in VISUAL_QUERIES.split(",") if q.strip()]
 
-        print(f"Tema V9: {theme_name}")
-        print(f"Scene automatiche: {len(scene_units)}")
-        print("2/5 Cerco visual controllati su Pexels + Pixabay...")
+        print(f"Tema V10: {theme}")
+        print(f"Scene: {len(scene_units)} | durata audio {total:.1f}s")
 
+        print("2/6 Avvio controllo visuale AI...")
+        validator = VisualValidator()
+
+        print("3/6 Cerco e valido le clip...")
         raw_clips = []
-        reused_flags = []
-        credits = []
+        selected = []
         used_refs = set()
-        used_sources = []
-        used_queries = []
         used_types = []
-        scene_debug = []
+        used_embeddings = []
+        credits = []
+        audit_rows = []
 
-        for scene_index, unit in enumerate(scene_units):
-            if manual_queries:
-                query = manual_queries[scene_index % len(manual_queries)]
-                query_type = "manual"
+        for i, sentence in enumerate(scene_units):
+            manual_query = manual_queries[i % len(manual_queries)] if manual_queries else None
 
-                chosen = best_candidate_for_query(
-                    query,
-                    query_type,
-                    scene_index,
-                    used_refs,
-                    used_sources,
-                    allow_reuse=False,
-                )
-                reused = False
+            candidate, visual_type, emb, audit, attempts, reused = choose_for_scene(
+                validator=validator,
+                theme=theme,
+                sentence=sentence,
+                scene_index=i,
+                used_types=used_types,
+                used_refs=used_refs,
+                used_embeddings=used_embeddings,
+                selected_history=selected,
+                manual_query=manual_query,
+            )
 
-                if not chosen:
-                    chosen = best_candidate_for_query(
-                        query,
-                        query_type,
-                        scene_index,
-                        used_refs,
-                        used_sources,
-                        allow_reuse=True,
-                    )
-                    reused = bool(chosen)
+            dest = work / f"raw_{i}.mp4"
+            if reused:
+                previous_path = next((x["path"] for x in reversed(selected) if x["candidate"].ref == candidate.ref), None)
+                if previous_path and Path(previous_path).exists():
+                    shutil.copyfile(previous_path, dest)
+                else:
+                    download(candidate.media_url, dest)
             else:
-                chosen, query, query_type, reused = choose_scene_candidate(
-                    theme_name,
-                    unit,
-                    scene_index,
-                    used_refs,
-                    used_sources,
-                    used_queries,
-                    used_types,
-                )
-
-            if not chosen:
-                raise RuntimeError(
-                    f"Nessun visual affidabile per la scena {scene_index + 1}. "
-                    "V9 preferisce fermarsi piuttosto che inserire una clip fuori tema."
-                )
-
-            dest = work / f"raw_{scene_index}.mp4"
-            download(chosen["media_url"], dest)
+                download(candidate.media_url, dest)
 
             raw_clips.append(dest)
-            reused_flags.append(reused)
-            used_refs.add(chosen["ref"])
-            used_sources.append(chosen["source"])
-            used_queries.append(query)
-            used_types.append(query_type)
+            if not reused:
+                used_refs.add(candidate.ref)
+                if emb is not None:
+                    used_embeddings.append(emb)
+            used_types.append(visual_type)
 
-            credits.append(
-                f"Scena {scene_index + 1} | tema={theme_name} | fonte={chosen['source']} | "
-                f"{query} | tipo={query_type} | reused={reused} | "
-                f"id={chosen['id']} | {chosen['creator']} | {chosen['page_url']}"
-            )
-
-            scene_debug.append({
-                "scene": scene_index + 1,
-                "text": unit,
-                "theme": theme_name,
-                "query": query,
-                "query_type": query_type,
-                "source": chosen["source"],
-                "video_id": chosen["id"],
+            record = {
+                "scene": i + 1,
+                "text": sentence,
+                "duration": round(durations[i], 2),
+                "theme": theme,
+                "visual_type": visual_type,
+                "source": candidate.source,
+                "video_id": candidate.id,
+                "query": candidate.query,
                 "reused": reused,
-                "seconds": round(durations[scene_index], 2),
+                "audit": audit,
+                "attempts": attempts,
+            }
+            audit_rows.append(record)
+            selected.append({
+                "candidate": candidate,
+                "visual_type": visual_type,
+                "embedding": emb,
+                "audit": audit,
+                "path": str(dest),
             })
 
+            credits.append(
+                f"Scena {i + 1} | {candidate.source} | id={candidate.id} | "
+                f"tipo={visual_type} | query={candidate.query} | {candidate.creator} | {candidate.page_url}"
+            )
             print(
-                f"Scena {scene_index + 1}: tema='{theme_name}' fonte='{chosen['source']}' "
-                f"tipo='{query_type}' query='{query}' id={chosen['id']} reused={reused}"
+                f"Scena {i + 1}: tipo='{visual_type}' fonte='{candidate.source}' "
+                f"id={candidate.id} reused={reused} query='{candidate.query}' audit={audit}"
             )
 
-        print("3/5 Adatto le clip al formato TikTok...")
+        print("4/6 Adatto le clip al formato TikTok...")
         norm = []
-
-        for i, (src, seconds, reused) in enumerate(zip(raw_clips, durations, reused_flags)):
+        for i, (src, seconds) in enumerate(zip(raw_clips, durations)):
             dst = work / f"norm_{i}.mp4"
-            normalize_clip(src, dst, seconds, i, reused=reused)
+            normalize_clip(src, dst, seconds, i, audit_rows[i]["reused"])
             norm.append(dst)
 
         concat_file = work / "concat.txt"
-        concat_file.write_text(
-            "\n".join(f"file '{p.as_posix()}'" for p in norm),
-            encoding="utf-8",
-        )
-
+        concat_file.write_text("\n".join(f"file '{p.as_posix()}'" for p in norm), encoding="utf-8")
         visuals = work / "visuals.mp4"
-        run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_file), "-c", "copy", str(visuals)
-        ])
+        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(visuals)])
 
-        print("4/5 Creo sottotitoli...")
+        print("5/6 Creo sottotitoli...")
         ass = work / "captions.ass"
         write_ass(ass, boundaries)
 
-        print("5/5 Render finale...")
+        print("6/6 Render finale...")
         video_filename = f"orologi_video_{SAFE_REQUEST_ID}.mp4"
         final = OUT / video_filename
-
         run([
             "ffmpeg", "-y", "-i", str(visuals), "-i", str(voice_mp3),
             "-vf", f"ass={ass.as_posix()}",
@@ -1006,32 +1100,24 @@ def main():
             "-shortest", "-movflags", "+faststart", str(final),
         ])
 
-        (OUT / "scene_plan.json").write_text(
-            json.dumps(scene_debug, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        (OUT / "visual_audit.json").write_text(
+            json.dumps(audit_rows, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-
         (OUT / "credits.txt").write_text(
             "Visual forniti tramite Pexels e Pixabay.\n\n" + "\n".join(credits),
             encoding="utf-8",
         )
 
-        write_meta(
-            "generate_video",
-            "ok",
-            {
-                "file": video_filename,
-                "duration": round(total, 2),
-                "theme": theme_name,
-                "scene_count": len(scene_debug),
-                "scenes": scene_debug,
-                "video_refs": list(used_refs),
-                "sources": used_sources,
-            },
-        )
+        write_meta("generate_video", "ok", {
+            "file": video_filename,
+            "duration": round(total, 2),
+            "theme": theme,
+            "scene_count": len(audit_rows),
+            "scenes": audit_rows,
+            "visual_validator": "clip" if validator.available else "metadata_fallback",
+        })
 
         print(f"VIDEO PRONTO: {final} ({total:.1f}s)")
-
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
