@@ -72,11 +72,13 @@ permissions:
 
 env:
   PYTHONUNBUFFERED: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  HF_HOME: ~/.cache/huggingface
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
 
     concurrency:
       group: watch-video-generator
@@ -96,13 +98,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache modello AI e pip
+        if: ${{ inputs.mode != 'deploy_only' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/pip
+          key: ${{ runner.os }}-watch-visual-ai-v10
+
       - name: Installa dipendenze
         if: ${{ inputs.mode != 'deploy_only' }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
           python -m pip install --upgrade pip -q
-          pip install edge-tts==7.2.8 "requests>=2.32.0" -q
+          pip install --index-url https://download.pytorch.org/whl/cpu torch -q
+          pip install edge-tts==7.2.8 "requests>=2.32.0" "pillow>=10.0" "transformers>=4.45,<5" -q
 
       - name: Genera contenuto
         if: ${{ inputs.mode != 'deploy_only' }}
@@ -115,10 +127,9 @@ jobs:
           RATE: ${{ inputs.rate }}
           OUTRO: ${{ inputs.outro }}
           VISUAL_QUERIES: ${{ inputs.visual_queries }}
-
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-
+          CLIP_MODEL: openai/clip-vit-base-patch32
         run: |
           python generate_video.py
 
